@@ -2,7 +2,7 @@
 
 A public-ready packaging folder for the Hermes router-first tool-loading work.
 
-This project is for people who already run Hermes and want to reduce first-turn token bloat by loading only the tool groups that are likely needed for the user's request. If the router is unsure, it declines reduction and Hermes loads the full tool surface.
+This project is for people who already run Hermes and want smarter first-turn tool loading to reduce prompt bloat by loading only the tool groups that are likely needed for the user's request. If the router is unsure, it declines reduction and Hermes loads the full tool surface.
 
 ## What this includes
 
