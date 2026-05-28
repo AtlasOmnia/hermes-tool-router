@@ -59,6 +59,21 @@ def _filter_platform_unsupported(names: List[str], platform: Optional[str]) -> L
     return names
 
 
+def _configured_floor_toolsets(
+    router_config: Dict[str, Any],
+    available_toolsets: Dict[str, str],
+    disabled_toolsets: Optional[List[str]],
+) -> List[str]:
+    disabled = set(disabled_toolsets or [])
+    configured = router_config.get("floor_toolsets") or []
+    if isinstance(configured, str):
+        configured = [configured]
+    return [
+        name for name in configured
+        if name in available_toolsets and name not in disabled
+    ]
+
+
 def _external_policy_path(router_config: Dict[str, Any]) -> Optional[Path]:
     path = (router_config or {}).get("policy_path")
     if path:
@@ -149,8 +164,17 @@ def resolve_effective_toolsets(
                 available_toolsets,
             )
             if should_reduce:
-                floor = [name for name in SAFE_CORE_TOOLSETS if name in available_toolsets]
-                wanted = _dedupe(floor + list(predicted or []) + skill_toolsets)
+                disabled = set(disabled_toolsets or [])
+                safe_core = [
+                    name for name in SAFE_CORE_TOOLSETS
+                    if name in available_toolsets and name not in disabled
+                ]
+                floor = _configured_floor_toolsets(router_config, available_toolsets, disabled_toolsets)
+                filtered_predicted = [
+                    name for name in (predicted or [])
+                    if name in available_toolsets and name not in disabled
+                ]
+                wanted = _dedupe(safe_core + floor + filtered_predicted + skill_toolsets)
                 if enabled_toolsets_explicit and platform_toolsets is not None:
                     allowed = set(platform_toolsets) | set(skill_toolsets)
                     wanted = [name for name in wanted if name in allowed]

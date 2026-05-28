@@ -44,6 +44,13 @@ def resolve_toolsets(
         name for name in skill_toolsets
         if name in available_toolsets and name not in disabled
     ]
+    configured_floor = router_config.get("floor_toolsets") or []
+    if isinstance(configured_floor, str):
+        configured_floor = [configured_floor]
+    floor = [
+        name for name in configured_floor
+        if name in available_toolsets and name not in disabled
+    ]
 
     effective = list(platform_toolsets) if platform_toolsets is not None else None
     router_predicted: Optional[List[str]] = None
@@ -67,7 +74,11 @@ def resolve_toolsets(
             predicted, should_reduce = [], False
 
         if should_reduce:
-            wanted = _dedupe(safe_core + list(predicted or []) + skills)
+            filtered_predicted = [
+                name for name in (predicted or [])
+                if name in available_toolsets and name not in disabled
+            ]
+            wanted = _dedupe(safe_core + floor + filtered_predicted + skills)
             if enabled_toolsets_explicit and platform_toolsets is not None:
                 allowed = set(platform_toolsets) | set(skills)
                 wanted = [name for name in wanted if name in allowed]

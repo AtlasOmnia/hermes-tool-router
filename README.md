@@ -20,6 +20,8 @@ Important safety rule: when prediction returns `([], False)`, the router has dec
 
 The external policy plugin lives outside the Hermes core checkout so Hermes updates are less likely to overwrite local routing rules.
 
+If the router mispredicts and the model calls a tool that was not loaded, Hermes detects the invalid tool name and injects the missing toolset on the fly before retrying the turn. This recall mechanism means a wrong prediction degrades to one extra API call rather than a failed response. Each missing toolset is recovered at most once per session; if the same toolset is needed again it is already present.
+
 ## Conservative routing
 
 For conservative deployments, set a confidence threshold and keep the long-message decline threshold visible in router config:
@@ -29,11 +31,14 @@ router_config:
   enabled: true
   confidence_threshold: 0.7
   long_message_decline_chars: 600
+  floor_toolsets: []
 ```
 
 Without a confidence threshold, a classifier response with low confidence can still reduce the tool surface. A higher threshold preserves quality by forcing uncertain prompts back to the full tool surface.
 
 `long_message_decline_chars` defaults to `600`. That is intentionally conservative: longer, multi-step prompts skip router reduction and load the full tool surface. If your prompts are often long and you want more savings, you can raise this value, but doing so sends more complex prompts through the classifier and can increase misrouting risk.
+
+`floor_toolsets` is optional. It is merged into every reduced route, then filtered by any explicit platform/toolset allowlist. Leave it empty for maximum token savings. For quality-first deployments that often need shell/date/system checks, use `floor_toolsets: [clarify, terminal]`.
 
 ## Local router model
 
@@ -48,6 +53,7 @@ router_config:
   api_key: local
   confidence_threshold: 0.7
   long_message_decline_chars: 600
+  floor_toolsets: []
 ```
 
 For Ollama's OpenAI-compatible endpoint, use the Ollama model name and base URL for your setup, commonly:
@@ -60,6 +66,7 @@ router_config:
   base_url: http://localhost:11434/v1
   api_key: local
   confidence_threshold: 0.7
+  floor_toolsets: []
 ```
 
 Use a small, reliable instruction-following model for the router. If the classifier is weak, keep `confidence_threshold` high or disable reduction for safety.
@@ -82,6 +89,8 @@ Read these fields in the output:
 - `full_surface`: whether the router declined reduction and loaded the full tool surface.
 
 For an apples-to-apples comparison, run once with router reduction enabled and once with it disabled, using the same model and Hermes config.
+
+To see per-toolset averages and recall frequencies from real sessions, run `python scripts/router_feedback_report.py` from your Hermes checkout. It reads the local feedback event log and summarizes which routes reduced tokens, how often recall fired, and which routes had the most failures.
 
 ## Cache tradeoff
 

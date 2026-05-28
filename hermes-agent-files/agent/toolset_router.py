@@ -86,6 +86,11 @@ def predict_toolsets(
     max_tokens = int(router_config.get("max_tokens") or 200)
     temperature = float(router_config.get("temperature") if router_config.get("temperature") is not None else 0.0)
     confidence_threshold = float(router_config.get("confidence_threshold") or 0.0)
+    if "confidence_threshold" not in router_config:
+        logger.warning(
+            "router_config.confidence_threshold is not set; defaulting to 0.0. "
+            "Use 0.7 for conservative public deployments."
+        )
     explicit_base_url = router_config.get("base_url") or None
     explicit_api_key = router_config.get("api_key") or None
 

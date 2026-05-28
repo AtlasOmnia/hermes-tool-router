@@ -128,3 +128,58 @@ def test_explicit_toolset_allowlist_is_respected(monkeypatch):
 
     assert result.enabled_toolsets == ["web"]
     assert "terminal" not in result.enabled_toolsets
+
+
+def test_disabled_toolsets_are_removed_from_router_prediction(monkeypatch):
+    _disable_external_policy(monkeypatch)
+    monkeypatch.setattr(toolset_policy, "_active_skill_toolsets", lambda _disabled: [])
+    monkeypatch.setattr(toolset_router, "predict_toolsets", lambda *_args: (["terminal", "web"], True))
+
+    result = toolset_policy.resolve_effective_toolsets(
+        user_message="run a command and search",
+        router_config={"enabled": True},
+        available_toolsets=AVAILABLE_TOOLSETS,
+        platform_toolsets=["clarify"],
+        enabled_toolsets_explicit=False,
+        disabled_toolsets=["terminal"],
+    )
+
+    assert "terminal" not in result.enabled_toolsets
+    assert "terminal" not in result.router_predicted_toolsets
+    assert "web" in result.enabled_toolsets
+
+
+def test_configured_floor_merges_into_clarify_prediction(monkeypatch):
+    _disable_external_policy(monkeypatch)
+    monkeypatch.setattr(toolset_policy, "_active_skill_toolsets", lambda _disabled: [])
+    monkeypatch.setattr(toolset_router, "predict_toolsets", lambda *_args: (["clarify"], True))
+
+    result = toolset_policy.resolve_effective_toolsets(
+        user_message="what is today's date?",
+        router_config={"enabled": True, "floor_toolsets": ["clarify", "terminal"]},
+        available_toolsets=AVAILABLE_TOOLSETS,
+        platform_toolsets=["clarify"],
+        enabled_toolsets_explicit=False,
+        disabled_toolsets=[],
+    )
+
+    assert result.enabled_toolsets == ["web", "clarify", "terminal"]
+    assert result.router_predicted_toolsets == result.enabled_toolsets
+
+
+def test_configured_floor_respects_explicit_allowlist(monkeypatch):
+    _disable_external_policy(monkeypatch)
+    monkeypatch.setattr(toolset_policy, "_active_skill_toolsets", lambda _disabled: [])
+    monkeypatch.setattr(toolset_router, "predict_toolsets", lambda *_args: (["clarify"], True))
+
+    result = toolset_policy.resolve_effective_toolsets(
+        user_message="what is today's date?",
+        router_config={"enabled": True, "floor_toolsets": ["clarify", "terminal"]},
+        available_toolsets=AVAILABLE_TOOLSETS,
+        platform_toolsets=["clarify"],
+        enabled_toolsets_explicit=True,
+        disabled_toolsets=[],
+    )
+
+    assert result.enabled_toolsets == ["clarify"]
+    assert "terminal" not in result.enabled_toolsets

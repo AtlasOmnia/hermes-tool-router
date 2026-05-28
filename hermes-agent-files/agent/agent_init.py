@@ -1310,7 +1310,7 @@ def init_agent(
     # provider tools (fact_store, etc.) into the tool surface — a 10x latency
     # penalty on local models and a frequent trigger of tool-call loops.
     if agent._memory_manager and agent.tools is not None and (
-        agent.enabled_toolsets is None or "memory" in agent.enabled_toolsets
+        _effective_enabled is None or "memory" in _effective_enabled
     ):
         _existing_tool_names = {
             t.get("function", {}).get("name")
@@ -1634,8 +1634,8 @@ def init_agent(
         and agent.context_compressor
         and agent.tools is not None
         and (
-            agent.enabled_toolsets is None
-            or "context_engine" in agent.enabled_toolsets
+            _effective_enabled is None
+            or "context_engine" in _effective_enabled
         )
     ):
         _existing_tool_names = {
