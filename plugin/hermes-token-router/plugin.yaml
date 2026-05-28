@@ -1,0 +1,4 @@
+name: hermes-token-router
+version: "0.1.0"
+description: User-owned toolset routing policy for Hermes token reduction.
+kind: standalone
