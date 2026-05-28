@@ -1,4 +1,4 @@
-﻿# What Stays Private
+# What Stays Private
 
 Your full Hermes workspace is private operational data, not part of this public project.
 

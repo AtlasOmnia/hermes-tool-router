@@ -1,4 +1,4 @@
-﻿# Patch File Removed From Public Folder
+# Patch File Removed From Public Folder
 
 The generated patch was intentionally removed from the public package because it was produced against a local baseline that contained a private hardcoded persona. Even though the patch removed that persona, deleted diff lines would still expose private material.
 

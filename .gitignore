@@ -1,4 +1,4 @@
-﻿# Ignore private/runtime material
+# Ignore private/runtime material
 .env
 *.env
 *.log
