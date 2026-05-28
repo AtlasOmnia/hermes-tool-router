@@ -1,0 +1,66 @@
+name: Feature request
+description: Suggest an improvement or new capability for Hermes Tool Router
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Clear use cases help prioritize the right work.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What problem would this solve? Who needs it?
+      placeholder: Describe the workflow, limitation, or opportunity.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Hermes Tool Router to do?
+      placeholder: Describe the behavior, API, config, or UX you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Are there existing workarounds or other approaches?
+    validations:
+      required: false
+
+  - type: textarea
+    id: example
+    attributes:
+      label: Example configuration or usage
+      description: Optional example showing how this feature might be used.
+      render: yaml
+    validations:
+      required: false
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      options:
+        - Nice to have
+        - Improves an existing workflow
+        - Blocks an important workflow
+        - Security or reliability related
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submit checklist
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: This request is focused on Hermes Tool Router, not unrelated Hermes Agent behavior.
+          required: true
