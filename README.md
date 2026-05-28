@@ -1,4 +1,4 @@
-# Hermes Token Router
+# Hermes Tool Router
 
 A public-ready packaging folder for the Hermes router-first tool-loading work.
 
