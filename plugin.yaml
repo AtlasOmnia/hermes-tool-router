@@ -1,0 +1,13 @@
+name: hermes-token-router
+version: 0.1.0
+description: "Hermes Tool Router — pre-turn toolset prediction with request_toolset recovery. Narrows tool schemas to reduce prompt token overhead, then expands safely on demand."
+author: "Jonathan Rivera"
+license: MIT
+kind: standalone
+requires_env: []
+provides_hooks:
+  - pre_turn_context_build
+  - pre_llm_call
+  - post_tool_call
+provides_tools:
+  - request_toolset

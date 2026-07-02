@@ -1,0 +1,21 @@
+# Hermes Tool Router configuration
+# Copy this file with the plugin and enable either global or selected profiles.
+# Safe default: disabled until you opt in.
+
+global:
+  enabled: false
+  # floor_toolsets are always kept when routing narrows the tool surface.
+  # Set [] for maximum token savings and rely on request_toolset recovery.
+  floor_toolsets: [terminal, file, web]
+  deterministic_rules_enabled: true
+  confidence_threshold: 0.0
+  long_message_decline_chars: 12000
+  short_message_bypass_chars: 0
+  router_provider: deepseek
+  router_model: deepseek-chat
+
+profiles:
+  # Example profile-specific override. Rename "router-test" to your test profile name.
+  router-test:
+    enabled: false
+    floor_toolsets: [terminal, file, web]

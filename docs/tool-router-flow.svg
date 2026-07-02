@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680" role="img" aria-labelledby="title desc">
+  <title id="title">Hermes Tool Router flow</title>
+  <desc id="desc">A flow diagram showing the user turn entering the pre-turn hook, deterministic rules, optional small router model, narrowed tool schema, main model call, and request_toolset recovery.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="1" stop-color="#13203a"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#17223d"/>
+      <stop offset="1" stop-color="#111a31"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="14" markerHeight="14" refX="10" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7dd3fc"/>
+    </marker>
+    <style>
+      .title{font:800 42px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;fill:#eef4ff;letter-spacing:-1.8px}
+      .subtitle{font:400 18px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;fill:#9badc7}
+      .label{font:800 20px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;fill:#eef4ff}
+      .body{font:400 15px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;fill:#9badc7}
+      .tiny{font:700 13px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;fill:#0b1020}
+      .badge{font:800 13px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;fill:#d9f99d}
+      .card{fill:url(#card);stroke:#2b3958;stroke-width:1.5}
+      .green{fill:#12362f;stroke:#34d399;stroke-width:1.5}
+      .yellow{fill:#3b2e12;stroke:#fbbf24;stroke-width:1.5}
+      .line{stroke:#7dd3fc;stroke-width:3;fill:none;marker-end:url(#arrow)}
+      .muted-line{stroke:#4b5d80;stroke-width:2;fill:none;stroke-dasharray:8 8;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1200" height="680" rx="30" fill="url(#bg)"/>
+  <circle cx="150" cy="80" r="210" fill="#7dd3fc" opacity="0.09"/>
+  <circle cx="1070" cy="620" r="260" fill="#6ee7b7" opacity="0.08"/>
+
+  <text x="54" y="72" class="title">Hermes Tool Router</text>
+  <text x="56" y="104" class="subtitle">Reduce tool-schema tokens before the main model call, with fail-open safety and recovery.</text>
+
+  <rect x="56" y="170" width="180" height="112" rx="18" class="card"/>
+  <text x="82" y="210" class="label">User turn</text>
+  <text x="82" y="240" class="body">Latest message</text>
+  <text x="82" y="263" class="body">arrives in Hermes</text>
+
+  <path d="M238 226 H318" class="line"/>
+
+  <rect x="330" y="150" width="220" height="152" rx="18" class="card"/>
+  <text x="356" y="190" class="label">Pre-turn hook</text>
+  <text x="356" y="220" class="body">Runs before prompt</text>
+  <text x="356" y="243" class="body">and tool schemas</text>
+  <text x="356" y="266" class="body">are assembled</text>
+
+  <path d="M552 226 H626" class="line"/>
+
+  <rect x="640" y="122" width="230" height="110" rx="18" class="green"/>
+  <text x="666" y="160" class="label">Deterministic rules</text>
+  <text x="666" y="190" class="body">Fast local patterns</text>
+  <text x="666" y="213" class="body">No data egress</text>
+
+  <rect x="640" y="268" width="230" height="126" rx="18" class="yellow"/>
+  <text x="666" y="306" class="label">Small router model</text>
+  <text x="666" y="336" class="body">Only if rules cannot</text>
+  <text x="666" y="359" class="body">classify the turn</text>
+  <text x="666" y="382" class="body">Returns JSON toolsets</text>
+
+  <path d="M755 232 V258" class="muted-line"/>
+  <text x="885" y="330" class="subtitle">Timeout/error/no key?</text>
+  <path d="M870 344 C948 344 950 456 870 456" class="muted-line"/>
+
+  <path d="M872 178 H942 V226 H988" class="line"/>
+  <path d="M872 330 H942 V226 H988" class="line"/>
+
+  <rect x="1000" y="152" width="150" height="148" rx="18" class="card"/>
+  <text x="1024" y="190" class="label">Narrowed</text>
+  <text x="1024" y="216" class="label">tool schema</text>
+  <text x="1024" y="250" class="body">Predicted tools</text>
+  <text x="1024" y="273" class="body">+ floor toolsets</text>
+
+  <rect x="260" y="442" width="250" height="128" rx="18" class="card"/>
+  <text x="286" y="482" class="label">Main model call</text>
+  <text x="286" y="512" class="body">Receives less tool bloat</text>
+  <text x="286" y="535" class="body">and focuses on likely actions</text>
+
+  <path d="M1074 302 V506 H522" class="line"/>
+
+  <rect x="620" y="442" width="250" height="128" rx="18" class="yellow"/>
+  <text x="646" y="482" class="label">request_toolset</text>
+  <text x="646" y="512" class="body">Escape hatch when a</text>
+  <text x="646" y="535" class="body">filtered toolset is needed</text>
+
+  <path d="M620 506 H522" class="muted-line"/>
+  <path d="M745 442 V404" class="muted-line"/>
+
+  <rect x="56" y="614" width="174" height="34" rx="17" fill="#12362f" stroke="#34d399"/>
+  <text x="76" y="636" class="badge">Fail-open by design</text>
+  <rect x="250" y="614" width="236" height="34" rx="17" fill="#102f42" stroke="#7dd3fc"/>
+  <text x="270" y="636" class="badge">Small, low-latency router</text>
+  <rect x="506" y="614" width="240" height="34" rx="17" fill="#3b2e12" stroke="#fbbf24"/>
+  <text x="526" y="636" class="badge">Recovery tool always available</text>
+</svg>

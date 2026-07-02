@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hermes Tool Router — How It Works</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #111a31;
+      --panel-2: #17223d;
+      --ink: #eef4ff;
+      --muted: #9badc7;
+      --line: #2b3958;
+      --accent: #6ee7b7;
+      --accent-2: #7dd3fc;
+      --warn: #fbbf24;
+      --danger: #fb7185;
+      --ok: #34d399;
+      --shadow: 0 24px 80px rgba(0, 0, 0, .35);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at top left, rgba(125, 211, 252, .13), transparent 34rem),
+        radial-gradient(circle at bottom right, rgba(110, 231, 183, .10), transparent 38rem),
+        var(--bg);
+      color: var(--ink);
+      line-height: 1.5;
+    }
+
+    main {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 48px 0 72px;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: 1.1fr .9fr;
+      gap: 32px;
+      align-items: end;
+      margin-bottom: 28px;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(2.2rem, 5vw, 4.8rem);
+      line-height: .94;
+      letter-spacing: -.06em;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: clamp(1.35rem, 2.4vw, 2.1rem);
+      letter-spacing: -.035em;
+    }
+
+    p { margin: 0; color: var(--muted); }
+    code {
+      color: #d9f99d;
+      background: rgba(217, 249, 157, .08);
+      border: 1px solid rgba(217, 249, 157, .16);
+      border-radius: 7px;
+      padding: 1px 6px;
+    }
+
+    .lede {
+      max-width: 760px;
+      font-size: 1.15rem;
+    }
+
+    .badge-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+
+    .badge {
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, .04);
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: .9rem;
+      white-space: nowrap;
+    }
+
+    .diagram {
+      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.02));
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      padding: 26px;
+      overflow: hidden;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr 54px 1fr 54px 1fr;
+      align-items: center;
+      gap: 0;
+      margin-bottom: 22px;
+    }
+
+    .node {
+      min-height: 164px;
+      border: 1px solid var(--line);
+      background: rgba(17, 26, 49, .82);
+      border-radius: 22px;
+      padding: 18px;
+      position: relative;
+    }
+
+    .node strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 1.05rem;
+    }
+
+    .node small {
+      color: var(--muted);
+      display: block;
+    }
+
+    .num {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      background: var(--accent-2);
+      color: #06131c;
+      display: inline-grid;
+      place-items: center;
+      font-weight: 800;
+      margin-bottom: 14px;
+    }
+
+    .arrow {
+      color: var(--accent-2);
+      font-size: 2rem;
+      text-align: center;
+      opacity: .88;
+    }
+
+    .decision {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      margin-top: 20px;
+    }
+
+    .path {
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.035);
+      border-radius: 22px;
+      padding: 18px;
+    }
+
+    .path h3 {
+      margin: 0 0 8px;
+      font-size: 1rem;
+      letter-spacing: -.02em;
+    }
+
+    .path ul {
+      margin: 10px 0 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }
+
+    .path li { margin: 6px 0; }
+    .local h3 { color: var(--ok); }
+    .router h3 { color: var(--warn); }
+
+    .comparison {
+      margin-top: 34px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }
+
+    .stack {
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      overflow: hidden;
+      background: var(--panel);
+    }
+
+    .stack header {
+      display: block;
+      margin: 0;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255,255,255,.04);
+    }
+
+    .stack header b { display: block; }
+    .stack header span { color: var(--muted); font-size: .92rem; }
+
+    .tool-list {
+      display: grid;
+      gap: 8px;
+      padding: 18px;
+    }
+
+    .tool {
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 14px;
+      padding: 10px 12px;
+      color: var(--muted);
+      background: rgba(255,255,255,.025);
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .tool.keep {
+      color: var(--ink);
+      border-color: rgba(110, 231, 183, .35);
+      background: rgba(110, 231, 183, .08);
+    }
+
+    .tool.recovery {
+      color: #fde68a;
+      border-color: rgba(251, 191, 36, .38);
+      background: rgba(251, 191, 36, .08);
+    }
+
+    .caption {
+      margin-top: 14px;
+      font-size: .95rem;
+      color: var(--muted);
+    }
+
+    .callout {
+      margin-top: 26px;
+      border: 1px solid rgba(125, 211, 252, .28);
+      background: rgba(125, 211, 252, .07);
+      border-radius: 22px;
+      padding: 18px;
+    }
+
+    .callout b { color: var(--accent-2); }
+
+    @media (max-width: 900px) {
+      header, .comparison, .decision { grid-template-columns: 1fr; }
+      .badge-row { justify-content: flex-start; }
+      .flow { grid-template-columns: 1fr; gap: 12px; }
+      .arrow { transform: rotate(90deg); }
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      .node, .stack, .path { transition: transform .2s ease, border-color .2s ease; }
+      .node:hover, .stack:hover, .path:hover { transform: translateY(-2px); border-color: rgba(125, 211, 252, .45); }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Tool routing before the expensive prompt.</h1>
+        <p class="lede">Hermes Tool Router narrows the tool schema before Hermes assembles the final model request. Obvious turns stay local with deterministic rules; ambiguous turns can use a tiny classifier model; unsafe or uncertain cases fall open to the full toolset.</p>
+      </div>
+      <div class="badge-row" aria-label="Key properties">
+        <span class="badge">Pre-turn hook</span>
+        <span class="badge">Fail-open</span>
+        <span class="badge">Small router model</span>
+        <span class="badge">request_toolset recovery</span>
+      </div>
+    </header>
+
+    <section class="diagram" aria-labelledby="flow-title">
+      <h2 id="flow-title">Routing flow</h2>
+      <div class="flow">
+        <article class="node">
+          <span class="num">1</span>
+          <strong>User turn arrives</strong>
+          <small>The plugin receives the latest user message through <code>pre_turn_context_build</code>, before the prompt and tool schemas are assembled.</small>
+        </article>
+        <div class="arrow" aria-hidden="true">→</div>
+        <article class="node">
+          <span class="num">2</span>
+          <strong>Classify required toolsets</strong>
+          <small>Deterministic rules try obvious intents first. If they cannot classify the turn, a small router model can return JSON like <code>{"toolsets":["file"]}</code>.</small>
+        </article>
+        <div class="arrow" aria-hidden="true">→</div>
+        <article class="node">
+          <span class="num">3</span>
+          <strong>Send a smaller tool surface</strong>
+          <small>Hermes receives only the predicted tools plus any configured floor toolsets and the recovery tool.</small>
+        </article>
+      </div>
+
+      <div class="decision">
+        <article class="path local">
+          <h3>Fast local path</h3>
+          <p>For clear requests like “read this file” or “search the web,” deterministic rules route immediately. No prompt text leaves the machine.</p>
+          <ul>
+            <li>No router API call</li>
+            <li>Lowest latency</li>
+            <li>Covers obvious intent patterns</li>
+          </ul>
+        </article>
+        <article class="path router">
+          <h3>Small-model path</h3>
+          <p>For ambiguous turns, the plugin sends a short classifier prompt to a small OpenAI-compatible model. If it times out, errors, or lacks credentials, Hermes keeps the full toolset.</p>
+          <ul>
+            <li>Uses up to first 1,500 message characters</li>
+            <li>Requires JSON-following router model</li>
+            <li>Fails open to avoid dropped capabilities</li>
+          </ul>
+        </article>
+      </div>
+
+      <div class="comparison" aria-labelledby="schema-title">
+        <div class="stack">
+          <header>
+            <b>Without router</b>
+            <span>Every enabled tool schema goes into the request</span>
+          </header>
+          <div class="tool-list">
+            <div class="tool">terminal <span>included</span></div>
+            <div class="tool">file <span>included</span></div>
+            <div class="tool">web <span>included</span></div>
+            <div class="tool">browser <span>included</span></div>
+            <div class="tool">memory <span>included</span></div>
+            <div class="tool">skills <span>included</span></div>
+            <div class="tool">vision / image / tts / … <span>included</span></div>
+          </div>
+        </div>
+        <div class="stack">
+          <header>
+            <b>With router</b>
+            <span>Only likely-needed tools are exposed for this turn</span>
+          </header>
+          <div class="tool-list">
+            <div class="tool keep">file <span>predicted</span></div>
+            <div class="tool keep">terminal <span>floor</span></div>
+            <div class="tool recovery">request_toolset <span>escape hatch</span></div>
+            <div class="tool">web <span>filtered</span></div>
+            <div class="tool">browser <span>filtered</span></div>
+            <div class="tool">memory / skills / vision / … <span>filtered</span></div>
+          </div>
+        </div>
+      </div>
+      <p class="caption">Example shown with <code>floor_toolsets: [terminal]</code>. Set <code>floor_toolsets: []</code> for maximum token savings, or keep terminal/file/web for conservative operation.</p>
+
+      <div class="callout">
+        <b>Recovery behavior:</b> if the model needs something that was filtered out, it calls <code>request_toolset</code>. The plugin expands the live tool surface and Hermes continues with the requested toolset available.
+      </div>
+    </section>
+  </main>
+</body>
+</html>
