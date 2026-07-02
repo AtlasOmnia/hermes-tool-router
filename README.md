@@ -135,6 +135,8 @@ Key settings:
 - `router_provider`: `deepseek` or `openrouter`.
 - `router_model`: model name for the selected provider.
 
+For X/Twitter prompts, consider pairing this router with [Hermes Tweet](https://github.com/Xquik-dev/hermes-tweet) as the social toolset. Keep `tweet_explore` available for planning, route `tweet_read` only when `XQUIK_API_KEY` is configured, and keep `tweet_action` behind an explicit `HERMES_TWEET_ENABLE_ACTIONS=true` gate.
+
 ## Provider notes
 
 Supported direct router providers:
