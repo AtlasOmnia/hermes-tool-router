@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-tool-router"
+version = "0.2.0rc1"
+description = "First-turn, session-sticky tool-surface router for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "Jonathan Rivera"}]
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+classifier = ["openai>=1.0.0"]
+dev = ["pytest>=8", "ruff>=0.6", "build>=1.2"]
+
+[project.entry-points."hermes_agent.plugins"]
+hermes-token-router = "hermes_token_router_plugin:register"
+
+[tool.setuptools]
+packages = ["hermes_token_router_plugin"]
+package-dir = {hermes_token_router_plugin = "."}
+
+[tool.setuptools.package-data]
+hermes_token_router_plugin = ["config.yaml", "plugin.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"tests/*.py" = ["E402"]
+"benchmarks/run.py" = ["E402"]

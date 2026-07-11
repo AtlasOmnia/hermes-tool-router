@@ -1,207 +1,123 @@
 # Hermes Tool Router
 
-A standalone Hermes Agent plugin that reduces prompt token overhead by selecting only the toolsets a turn is likely to need before Hermes builds the prompt and tool schema payload.
+Experimental standalone Hermes Agent plugin for reducing first-turn tool-schema overhead without repeatedly changing the tool prefix later in the conversation.
 
-It keeps a small recovery tool, `request_toolset`, available so the model can ask for a missing toolset during the turn instead of silently failing.
+> Test on a separate Hermes profile first. Do not install an experimental router directly on a primary profile.
 
-> **Proof-of-concept warning:** this plugin is experimental. Do not enable it first on your primary Hermes profile. Create a separate test profile, or enable it only on an alternate profile you can reset easily, then move it to daily use only after you have tested your toolset mix and routing behavior.
+## v0.2 design
 
-![Hermes Tool Router flow](docs/tool-router-flow.svg)
+- **First-turn routing:** deterministic intent classification narrows the live tool surface before the first provider request through stock Hermes hooks.
+- **Session-sticky surface:** later turns reuse the initial surface instead of reclassifying and shrinking it.
+- **Monotonic recovery:** requested toolsets are added permanently for the session.
+- **Fail open:** uncertainty, invalid classifier output, missing confidence, timeout, registry mismatch, or unsupported runtime keeps the full tool surface.
+- **Optional classifier:** external model routing is disabled by default. Deterministic misses fall back immediately with no network call.
+- **Dynamic recovery:** `request_toolset` is generated from the live toolset registry and can request multiple toolsets.
 
-For a larger visual walkthrough, open [`docs/how-it-works.html`](docs/how-it-works.html).
+## Critical compatibility fact
 
-## What it does
+First-turn token savings work through either an early Hermes surface hook or the stock `pre_llm_call` compatibility path. In current Hermes, `pre_llm_call` runs after the initial preflight estimate but before the actual provider request is assembled and before the loop's request-pressure estimate; mutating `agent.tools` there still reduces the transmitted tool schemas. The tradeoff is that the plugin must recover the live agent through compatibility logic unless Hermes passes it explicitly.
 
-- Runs before turn-context construction through Hermes' `pre_turn_context_build` hook.
-- Predicts needed toolsets with deterministic rules first. If no deterministic rule is confident, it can call a small, fast router model to classify the turn.
-- Mutates the live agent tool surface for the current turn only.
-- Falls back open to the full toolset on uncertainty, errors, long messages, unavailable router credentials, or unsupported hook versions.
-- Provides `request_toolset(toolset, reason)` as an escape hatch when the model needs a filtered-out toolset.
-- Keeps `pre_llm_call` as a compatibility fallback for older Hermes builds.
-
-## Requirements
-
-- Hermes Agent with plugin support.
-- Best with Hermes builds that expose the `pre_turn_context_build` hook.
-- Python package `pyyaml` available in the Hermes environment.
-- For deterministic-only routing: no model API key is required.
-- For full routing behavior on ambiguous/non-obvious requests: a small OpenAI-compatible router model is required, plus `openai` and either `DEEPSEEK_API_KEY` or `OPENROUTER_API_KEY`.
-
-Deterministic routing works without external API keys, but it only covers obvious intent patterns. Without a router model, uncertain turns fail open to the full toolset.
-
-## Dependencies
-
-Minimal runtime:
+Run diagnostics:
 
 ```bash
-pip install -r requirements.txt
+python diagnostics.py
 ```
 
-`pyyaml` is required for configuration loading. `openai` is only needed if you enable LLM-based router calls through DeepSeek or OpenRouter.
+Exit code `0` means a routing path is available before the provider request. Exit code `2` means the current runtime must not claim first-turn savings. The report separately states whether routing happens before the initial preflight estimate.
 
-Important: the router model should be small and low-latency. It runs before the main model call on turns that deterministic rules cannot classify, so using a large/slow model can erase the token savings with added delay.
+Automatic execution recovery uses Hermes's generic `tool_request` middleware. When the model emits a registry-known tool that was pruned, the middleware expands its owning toolset before normal validation and dispatch, then the original call continues through ordinary requirement checks and approvals. `request_toolset` remains the visible fallback.
 
-## Installation
+### No Hermes core patch required
 
-Recommended setup: install and test in a separate Hermes profile.
+The tested implementation is plugin-only. Current Hermes already provides both extension points needed for provider-request reduction and automatic tool recovery. There is no router edit in Hermes core and no router entry in `apply-patches.sh`. An optional earlier hook could reduce internal preflight work, but it is not required for the measured request savings or successful tool execution.
+
+See [docs/compatibility.md](docs/compatibility.md).
+
+## Install on a test profile
 
 ```bash
 hermes profile create router-test --clone
-```
-
-Then install the plugin for that profile's Hermes home. If your profile uses the standard layout, that means:
-
-```bash
 mkdir -p ~/.hermes/profiles/router-test/plugins
-cp -R hermes-token-router-public ~/.hermes/profiles/router-test/plugins/hermes-token-router
+cp -R . ~/.hermes/profiles/router-test/plugins/hermes-token-router
 ```
 
-Enable the plugin in the test profile config, not your main profile, until you are comfortable with its behavior:
-
-```yaml
-plugins:
-  enabled:
-    - hermes-token-router
-```
-
-Run a test session with:
-
-```bash
-hermes --profile router-test chat
-```
-
-Only after testing should you copy the plugin into your main `~/.hermes/plugins/` directory or enable it globally.
-
-Clone or copy this repository into your Hermes plugins folder under the plugin name `hermes-token-router`:
-
-```bash
-mkdir -p ~/.hermes/plugins
-cp -R hermes-token-router-public ~/.hermes/plugins/hermes-token-router
-```
-
-Enable it in your Hermes config:
-
-```yaml
-plugins:
-  enabled:
-    - hermes-token-router
-```
-
-Then edit the plugin's `config.yaml` and enable only the test profile at first.
-
-Example test-profile setup:
-
-```yaml
-global:
-  enabled: false
-
-profiles:
-  router-test:
-    enabled: true
-    floor_toolsets: [terminal, file, web]
-    deterministic_rules_enabled: true
-    long_message_decline_chars: 12000
-    router_provider: deepseek
-    router_model: deepseek-chat
-```
-
-Restart Hermes or start a fresh session after changing plugin configuration.
+Enable the plugin in the test profile, then set `profiles.router-test.enabled: true` in the plugin's `config.yaml`. Start a fresh session after configuration changes.
 
 ## Configuration
 
+The safe default is disabled. Important v2 settings:
+
 ```yaml
 global:
   enabled: false
-  floor_toolsets: [terminal, file, web]
+  routing_scope: first_turn
+  expansion_mode: monotonic
+  shrink_mid_session: false
+  floor_toolsets: []
   deterministic_rules_enabled: true
-  confidence_threshold: 0.0
-  long_message_decline_chars: 12000
-  short_message_bypass_chars: 0
-  router_provider: deepseek
-  router_model: deepseek-chat
-
-profiles:
-  router-test:
-    enabled: true
+  confidence_threshold: 0.90
+  fail_open: true
+  classifier:
+    enabled: false
 ```
 
-Key settings:
+The classifier remains opt-in because adding a network request before every uncertain main-model call can erase latency gains. When disabled, unresolved deterministic requests keep all tools. Direct DeepSeek is the default hosted classifier; OpenRouter is used only when explicitly selected. A local OpenAI-compatible endpoint can be configured as:
 
-- `enabled`: opt-in switch. Leave global disabled unless you intentionally want the router everywhere.
-- `floor_toolsets`: toolsets always retained after routing. Use `[]` for aggressive reduction.
-- `deterministic_rules_enabled`: fast regex-based routes for common intents.
-- `long_message_decline_chars`: bypass routing for complex long turns.
-- `short_message_bypass_chars`: optional bypass for very short messages.
-- `router_provider`: `deepseek` or `openrouter`.
-- `router_model`: model name for the selected provider.
+```yaml
+classifier:
+  enabled: true
+  provider: custom
+  model: router-local
+  base_url: http://127.0.0.1:1234/v1
+  api_key_env: null  # or an environment-variable name when authentication is required
+```
 
-## Provider notes
-
-Supported direct router providers:
-
-- `deepseek` via `DEEPSEEK_API_KEY`, default sample `deepseek-chat`.
-- `openrouter` via `OPENROUTER_API_KEY`, for example `meta-llama/llama-3.1-8b-instruct`.
-
-`openai-codex` is intentionally disabled in the plugin because Codex uses a Responses API transport, not standard Chat Completions.
-
-Recommended router model profile:
-
-- Small instruction model, roughly 7B-12B class or equivalent fast hosted model.
-- Strong JSON-following behavior.
-- Low latency, ideally sub-second for a short classification prompt.
-- Cheap enough to run on many turns.
-
-Examples:
-
-- `deepseek-chat` through DeepSeek, simple default and broadly available.
-- `meta-llama/llama-3.1-8b-instruct` through OpenRouter or another fast OpenAI-compatible provider.
-- A local OpenAI-compatible endpoint can be added by extending `_get_router_client()`.
-
-## Privacy and data egress
-
-When deterministic rules are enough, no user prompt text leaves the local Hermes process.
-
-If deterministic rules cannot classify the turn and router model credentials are available, the plugin sends up to the first 1,500 characters of the user message plus the available toolset list to the configured router provider. For sensitive environments, either:
-
-- keep `deterministic_rules_enabled: true` and avoid configuring router provider credentials, so uncertain turns fall back to the full local toolset;
-- set a high `confidence_threshold` and conservative `floor_toolsets`; or
-- disable the plugin for profiles that handle sensitive prompts.
-
-## Safety model
-
-The plugin is designed to fail open:
-
-- Config disabled: no changes.
-- No router credentials: full toolset fallback unless deterministic rules already made a confident route.
-- Router timeout or invalid JSON: full toolset fallback.
-- Unknown toolset: full toolset fallback.
-- Missing tool detected after narrowing: attempts to expand the owning toolset.
-
-The only intentionally aggressive mode is `floor_toolsets: []`, which can leave only `request_toolset` for plain-answer turns.
-
-## Development and tests
-
-Run the smoke tests from the repository root:
+## Development
 
 ```bash
-python3 -m py_compile *.py tests/*.py
-python3 tests/smoke_hardening.py
-python3 -m pytest tests -q
+python3 -m py_compile *.py tests/*.py benchmarks/*.py
+python3 -m pytest
+python3 benchmarks/run.py
+python3 -m build
 ```
 
-The tests use a fake Hermes tool registry and do not require live API credentials.
+The committed 500-record corpus is a synthetic regression suite. It validates deterministic contracts; it does not replace live full-tools-versus-routed E2E testing.
 
-## Repository contents
+## Current measured schema reduction
 
-- `__init__.py` — plugin registration, hooks, and recovery handler.
-- `config.py` — config loading and profile resolution.
-- `policy.py` — deterministic and LLM-based toolset prediction.
-- `tools.py` — registry resolution, filtering, expansion, and recovery tool schema.
-- `state.py` — agent-scoped router state.
-- `config.yaml` — safe disabled-by-default sample config.
-- `tests/` — smoke tests for routing and recovery.
-- `docs/pre_turn_context_build_hook.md` — design notes for the required core hook.
+Against the live 39-tool Hermes registry, Hermes's own rough request estimator measured:
+
+- `web`: 18,627 → 490 tokens (**97.37% reduction**)
+- `file,terminal`: 18,627 → 3,207 tokens (**82.78% reduction**)
+- `browser,web`: 18,627 → 3,364 tokens (**81.94% reduction**)
+
+See [`docs/baselines/v0.2-rc1.md`](docs/baselines/v0.2-rc1.md) for commands and caveats. These are estimator results, not provider billing receipts.
+
+## Live Edith A/B validation
+
+A paired full-tools-versus-routed evaluation using `openai/gpt-5.4-mini` produced:
+
+- **10/10** safe-core cases passed;
+- **100%** required-toolset recall;
+- **100%** exact route accuracy;
+- **100%** tool-call success and answer accuracy;
+- **61.60%** average reduction in actual first-provider-request tokens across the no-tool, terminal, and web pairs;
+- **94.239983** autoresearch score.
+
+The run used stock Hermes hooks and no core patch. See [`docs/live-evaluation-v0.2-rc1.md`](docs/live-evaluation-v0.2-rc1.md) for the corpus, methodology, commands, raw token counts, and scope limitations.
+
+## Current release gates
+
+A stable release must demonstrate:
+
+- at least 70% median first-turn schema-token reduction;
+- at least 99.5% required-toolset recall and 100% critical-class recall;
+- no unrecovered registered-tool failures in E2E testing;
+- no task-success regression against the full-tool baseline;
+- cache-stable serialized tool schemas after routing or the last expansion.
+
+No quantitative production claim should be made until a versioned live validation report satisfies those gates.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT.

@@ -18,8 +18,10 @@ try:
         DEFAULT_ROUTER_PROVIDER,
         PLUGIN_NAME,
         _get_profile_config,
+        _get_classifier_connection,
         _get_router_model,
         _get_router_provider,
+        _is_classifier_enabled,
         _is_router_active,
         _load_config,
     )
@@ -39,6 +41,7 @@ try:
     from .state import (
         ROUTER_STATE_ATTR,
         RouterState,
+        _drop_agent_ref,
         _get_agent_from_stack,
         _get_agent_ref,
         _get_router_state,
@@ -49,6 +52,7 @@ try:
         RECOVERY_TOOL_SCHEMA,
         RECOVERY_TOOLSET,
         RECOVERY_TOOLSET_CHOICES,
+        build_recovery_tool_schema,
         _apply_predicted_tools,
         _cache_full_toolset,
         _detect_missing_toolset,
@@ -70,8 +74,10 @@ except ImportError:  # pragma: no cover - direct loader fallback
         DEFAULT_ROUTER_PROVIDER,
         PLUGIN_NAME,
         _get_profile_config,
+        _get_classifier_connection,
         _get_router_model,
         _get_router_provider,
+        _is_classifier_enabled,
         _is_router_active,
         _load_config,
     )
@@ -91,6 +97,7 @@ except ImportError:  # pragma: no cover - direct loader fallback
     from state import (
         ROUTER_STATE_ATTR,
         RouterState,
+        _drop_agent_ref,
         _get_agent_from_stack,
         _get_agent_ref,
         _get_router_state,
@@ -101,6 +108,7 @@ except ImportError:  # pragma: no cover - direct loader fallback
         RECOVERY_TOOL_SCHEMA,
         RECOVERY_TOOLSET,
         RECOVERY_TOOLSET_CHOICES,
+        build_recovery_tool_schema,
         _apply_predicted_tools,
         _cache_full_toolset,
         _detect_missing_toolset,
@@ -154,21 +162,30 @@ def _route_tool_surface(source: str, agent: Any = None, **kwargs: Any) -> Option
     if not user_message:
         return None
 
+    session_id = str(kwargs.get("session_id") or getattr(agent, "session_id", "") or "")
     if agent is not None:
-        _store_agent_ref(agent)
+        _store_agent_ref(agent, session_id)
     else:
-        agent = _get_agent_ref()
-        if agent is None:
-            agent = _get_agent_from_stack()
-            if agent is not None:
-                _store_agent_ref(agent)
-                logger.info("%s: acquired agent reference via stack introspection", PLUGIN_NAME)
-            else:
-                logger.warning("%s: no agent reference; full set fallback", PLUGIN_NAME)
-                return None
+        # The current hook stack is authoritative; a cached session mapping can
+        # be stale after resets or test/profile reloads.
+        agent = _get_agent_from_stack() or _get_agent_ref(session_id)
+        if agent is not None:
+            session_id = session_id or str(getattr(agent, "session_id", "") or "")
+            _store_agent_ref(agent, session_id)
+            logger.info("%s: acquired agent reference for compatibility hook", PLUGIN_NAME)
+        else:
+            logger.warning("%s: no agent reference; full set fallback", PLUGIN_NAME)
+            return None
 
     turn_id = kwargs.get("turn_id") or getattr(agent, "_current_turn_id", "") or ""
     state = _get_router_state(agent)
+
+    # Production policy: classify only the initial tool surface. Later turns
+    # reuse the session-sticky surface so tool schemas remain cache-stable.
+    if state.initial_route_applied and source == "pre_turn_context_build":
+        if turn_id:
+            _mark_turn_routed(agent, state, turn_id, "sticky_surface")
+        return None
 
     if source != "pre_turn_context_build" and _was_turn_routed(agent, state, turn_id):
         logger.debug("%s: skipping duplicate late pre_llm_call for early-routed turn", PLUGIN_NAME)
@@ -190,6 +207,7 @@ def _route_tool_surface(source: str, agent: Any = None, **kwargs: Any) -> Option
     confidence_threshold = float(profile_cfg.get("confidence_threshold", 0.0))
     router_model = _get_router_model(profile_cfg)
     router_provider = _get_router_provider(profile_cfg)
+    classifier_base_url, classifier_api_key_env = _get_classifier_connection(profile_cfg)
     state.router_model = router_model
 
     profile_name = profile_cfg.get("_profile_name", "unknown")
@@ -258,24 +276,31 @@ def _route_tool_surface(source: str, agent: Any = None, **kwargs: Any) -> Option
             sorted(predicted),
         )
     else:
-        # Predict toolsets via router model
-        try:
-            predicted = _predict_toolsets_via_llm(
-                user_message,
-                available,
-                router_model,
-                confidence_threshold,
-                router_provider,
-            )
-        except Exception as exc:
-            logger.warning(
-                "%s: prediction failed: %s; full set fallback",
-                PLUGIN_NAME, exc,
-            )
-            _restore_full_tools(agent)
-            state.active = False
-            state.predicted_toolsets = None
-            return complete()
+        # The external classifier is opt-in. An unresolved deterministic route
+        # fails open immediately when it is disabled—zero network latency.
+        if not _is_classifier_enabled(profile_cfg):
+            predicted = None
+        else:
+            try:
+                predicted = _predict_toolsets_via_llm(
+                    user_message,
+                    available,
+                    router_model,
+                    confidence_threshold,
+                    router_provider,
+                    max(0.05, float(profile_cfg.get("router_hard_timeout_ms", 1200)) / 1000.0),
+                    classifier_base_url,
+                    classifier_api_key_env,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "%s: prediction failed: %s; full set fallback",
+                    PLUGIN_NAME, exc,
+                )
+                _restore_full_tools(agent)
+                state.active = False
+                state.predicted_toolsets = None
+                return complete()
 
     if predicted is None:
         # Bypass; keep full toolsets
@@ -310,9 +335,10 @@ def _route_tool_surface(source: str, agent: Any = None, **kwargs: Any) -> Option
         state.predicted_toolsets = None
         return complete()
 
-    # Store agent-scoped state for post_tool_call/request_toolset
+    # Store agent-scoped state for post_tool_call/request_toolset.
     state.active = True
     state.predicted_toolsets = predicted
+    state.set_initial_surface(set(predicted) | floor_toolsets)
     state._fallback_triggered = False
     state._retry_pending = False
 
@@ -330,64 +356,124 @@ def _route_tool_surface(source: str, agent: Any = None, **kwargs: Any) -> Option
 def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
     """Expand the live agent with one requested toolset."""
     requested_toolset = str(args.get("toolset") or args.get("toolset_name") or "").strip().lower()
+    raw_toolsets = args.get("toolsets") or []
+    requested_toolsets = {
+        str(name).strip().lower() for name in raw_toolsets if str(name).strip()
+    } if isinstance(raw_toolsets, list) else set()
+    if requested_toolset:
+        requested_toolsets.add(requested_toolset)
     requested_tool = str(args.get("tool_name") or "").strip()
     reason = str(args.get("reason") or "").strip()[:200]
 
     try:
         from tools.registry import registry
         available = set(registry.get_registered_toolset_names())
-        if requested_tool and not requested_toolset:
-            requested_toolset = _infer_toolset_from_tool(requested_tool, registry) or ""
-        alias_target = registry.get_toolset_alias_target(requested_toolset) if requested_toolset else None
-        if alias_target:
-            requested_toolset = alias_target
+        if requested_tool:
+            owner = _infer_toolset_from_tool(requested_tool, registry)
+            if owner:
+                requested_toolsets.add(owner)
+        requested_toolsets = {
+            registry.get_toolset_alias_target(name) or name for name in requested_toolsets
+        }
     except Exception:
         available = set()
 
-    if not requested_toolset:
+    if not requested_toolsets:
         return json.dumps({
             "ok": False,
-            "error": "toolset or resolvable tool_name is required",
-            "requested_toolset": requested_toolset,
+            "error": "toolsets or resolvable tool_name is required",
+            "requested_toolsets": [],
             "requested_tool": requested_tool,
         })
 
-    if available and requested_toolset not in available:
-        suggestions = difflib.get_close_matches(requested_toolset, sorted(available), n=5)
+    unknown = requested_toolsets - available if available else set()
+    if unknown:
+        bad = sorted(unknown)[0]
+        suggestions = difflib.get_close_matches(bad, sorted(available), n=5)
         return json.dumps({
             "ok": False,
-            "error": f"unknown toolset: {requested_toolset}",
-            "requested_toolset": requested_toolset,
+            "error": f"unknown toolset: {bad}",
+            "requested_toolsets": sorted(requested_toolsets),
             "requested_tool": requested_tool,
             "suggestions": suggestions,
             "available_toolsets": sorted(available),
         })
 
-    agent = _get_agent_ref() or _get_agent_from_stack()
+    session_id = str(kwargs.get("session_id") or "")
+    agent = _get_agent_ref(session_id) or _get_agent_from_stack()
     if agent is None:
         return json.dumps({
             "ok": False,
             "error": "no live agent reference",
-            "requested_toolset": requested_toolset,
+            "requested_toolsets": sorted(requested_toolsets),
             "requested_tool": requested_tool,
         })
 
     state = _get_router_state(agent)
     if state._full_tool_defs is None:
         _cache_full_toolset(agent)
-    _expand_toolset(agent, requested_toolset)
+    for toolset_name in sorted(requested_toolsets):
+        _expand_toolset(agent, toolset_name)
     _ensure_recovery_tool(agent)
     state.active = True
     state._retry_pending = False
 
     enabled_tools = sorted(getattr(agent, "valid_tool_names", set()) or set())
-    return json.dumps({
+    response = {
         "ok": True,
-        "toolset": requested_toolset,
+        "toolsets": sorted(requested_toolsets),
         "requested_tool": requested_tool,
         "reason": reason,
         "enabled_tools": enabled_tools,
-    })
+    }
+    if len(requested_toolsets) == 1:
+        response["toolset"] = next(iter(requested_toolsets))
+    return json.dumps(response)
+
+
+def tool_request_middleware(**kwargs: Any) -> Optional[Dict[str, Any]]:
+    """Expand a registry-known pruned tool before Hermes validates/dispatches it.
+
+    Hermes applies ``tool_request`` middleware before it passes the current
+    ``valid_tool_names`` set into normal dispatch. Updating the agent here lets
+    the original call continue through ordinary check_fn, approvals, and
+    execution without an invalid-tool round trip.
+    """
+    session_id = str(kwargs.get("session_id") or "")
+    tool_name = str(kwargs.get("tool_name") or "").strip()
+    args = kwargs.get("args")
+    if not tool_name or not isinstance(args, dict):
+        return None
+    agent = _get_agent_ref(session_id)
+    if agent is None:
+        return None
+    state = _get_router_state(agent)
+    if not state.active or tool_name in (getattr(agent, "valid_tool_names", set()) or set()):
+        return None
+    try:
+        from tools.registry import registry
+        toolset_name = _infer_toolset_from_tool(tool_name, registry)
+    except Exception:
+        toolset_name = None
+    if not toolset_name:
+        return None
+    _expand_toolset(agent, toolset_name)
+    if tool_name not in (getattr(agent, "valid_tool_names", set()) or set()):
+        return None
+    logger.info(
+        "%s: middleware recovery added toolset=%s for tool=%s session=%s",
+        PLUGIN_NAME,
+        toolset_name,
+        tool_name,
+        session_id,
+    )
+    return {"args": dict(args), "router_recovered": toolset_name}
+
+
+def on_session_end(**kwargs: Any) -> None:
+    session_id = str(kwargs.get("session_id") or "")
+    if session_id:
+        _drop_agent_ref(session_id)
 
 
 def register(ctx) -> None:
@@ -400,32 +486,36 @@ def register(ctx) -> None:
     """
 
     try:
-        ctx.register_hook("pre_turn_context_build", pre_turn_context_build)
+        from hermes_cli.plugins import VALID_HOOKS
+        if "pre_turn_context_build" in VALID_HOOKS:
+            ctx.register_hook("pre_turn_context_build", pre_turn_context_build)
     except Exception as exc:
-        logger.warning(
-            "%s: pre_turn_context_build hook unavailable; using pre_llm_call fallback: %s",
-            PLUGIN_NAME,
-            exc,
-        )
+        logger.debug("%s: early routing hook unavailable: %s", PLUGIN_NAME, exc)
 
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("post_tool_call", post_tool_call)
+    ctx.register_hook("on_session_end", on_session_end)
+    try:
+        ctx.register_middleware("tool_request", tool_request_middleware)
+    except Exception as exc:
+        logger.warning("%s: tool_request middleware unavailable: %s", PLUGIN_NAME, exc)
 
     try:
         from tools.registry import registry
+        recovery_schema = build_recovery_tool_schema(set(registry.get_registered_toolset_names()))
         registry.register(
             name=RECOVERY_TOOL_NAME,
             toolset=RECOVERY_TOOLSET,
-            schema=RECOVERY_TOOL_SCHEMA,
+            schema=recovery_schema,
             handler=request_toolset_handler,
-            description=RECOVERY_TOOL_SCHEMA["description"],
+            description=recovery_schema["description"],
             emoji="",
         )
     except Exception as exc:
         logger.warning("%s: failed to register recovery tool: %s", PLUGIN_NAME, exc)
 
     logger.info(
-        "%s plugin registered (hooks: pre_turn_context_build, pre_llm_call, post_tool_call; tool: request_toolset)",
+        "%s plugin registered (routing: pre_llm_call compatibility; middleware: tool_request; tool: request_toolset)",
         PLUGIN_NAME,
     )
 
@@ -453,7 +543,8 @@ def post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
     Returns None (observer hook, no return value consumed by caller).
     """
 
-    agent = _get_agent_ref() or _get_agent_from_stack()
+    session_id = str(kwargs.get("session_id") or "")
+    agent = _get_agent_ref(session_id) or _get_agent_from_stack()
     if agent is None:
         return None
     state = _get_router_state(agent)
@@ -487,21 +578,6 @@ def post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
         # Find which toolset this tool belongs to
         from tools.registry import registry
         missing_toolset = _infer_toolset_from_tool(tool_name, registry)
-
-        if missing_toolset is None:
-            logger.debug(
-                "%s: could not determine toolset for '%s' — checking by name prefix",
-                PLUGIN_NAME, tool_name,
-            )
-            # Fall back: add all tools for the inferred toolset
-            try:
-                from tools.registry import registry
-                for entry in registry._snapshot_entries():
-                    if entry.name == tool_name:
-                        missing_toolset = entry.toolset
-                        break
-            except Exception:
-                pass
 
         if missing_toolset is None:
             logger.debug(

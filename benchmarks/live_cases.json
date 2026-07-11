@@ -1,0 +1,72 @@
+[
+  {
+    "id": "answer_only",
+    "prompt": "What is photosynthesis? Answer accurately in one sentence.",
+    "expected_toolsets": [],
+    "expected_tools": [],
+    "must_contain": ["oxygen"]
+  },
+  {
+    "id": "terminal",
+    "prompt": "Use the terminal to run exactly this command without adding ./ or changing the path: `{{HERMES_PYTHON}} --version`. Return the exact output.",
+    "expected_toolsets": ["terminal"],
+    "expected_tools": ["terminal"],
+    "must_contain": ["Python 3.11.14"]
+  },
+  {
+    "id": "file",
+    "prompt": "Read /tmp/router-edith-probe.txt and return its exact contents only.",
+    "expected_toolsets": ["file"],
+    "expected_tools": ["read_file"],
+    "must_contain": ["EDITH_ROUTER_PROBE_OK"]
+  },
+  {
+    "id": "web",
+    "prompt": "Use web search to find the current weather in Tampa, Florida. Return temperature and conditions concisely.",
+    "expected_toolsets": ["web"],
+    "expected_tools": ["web_search"],
+    "must_contain": []
+  },
+  {
+    "id": "skills",
+    "prompt": "Load the hermes-agent skill before answering, then return the exact Hermes CLI command for listing installed plugins.",
+    "expected_toolsets": ["skills"],
+    "expected_tools": ["skill_view"],
+    "must_contain": ["hermes plugins list"]
+  },
+  {
+    "id": "cronjob",
+    "prompt": "Use the cronjob tool to list scheduled jobs. Do not create, change, or remove anything.",
+    "expected_toolsets": ["cronjob"],
+    "expected_tools": ["cronjob"],
+    "must_contain": []
+  },
+  {
+    "id": "session_search",
+    "prompt": "Use session search to find the previous Edith session where Tampa weather was tested. Return its session ID only.",
+    "expected_toolsets": ["session_search"],
+    "expected_tools": ["session_search"],
+    "must_contain": []
+  },
+  {
+    "id": "computer_use",
+    "prompt": "Use computer_use with action list_apps and report whether Safari is listed. Do not focus or raise any window.",
+    "expected_toolsets": ["computer_use"],
+    "expected_tools": ["computer_use"],
+    "must_contain": ["Safari"]
+  },
+  {
+    "id": "code_execution",
+    "prompt": "Use the sandboxed code_execution tool, not terminal, to calculate 7 multiplied by 9. Return only the number.",
+    "expected_toolsets": ["code_execution"],
+    "expected_tools": ["execute_code"],
+    "must_contain": ["63"]
+  },
+  {
+    "id": "todo",
+    "prompt": "Use the todo tool to create a two-item test task list, then report that it was created.",
+    "expected_toolsets": ["todo"],
+    "expected_tools": ["todo"],
+    "must_contain": []
+  }
+]

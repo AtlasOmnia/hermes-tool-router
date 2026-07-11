@@ -1,2 +1,3 @@
 pyyaml>=6.0
+# Optional; only required when classifier.enabled is true.
 openai>=1.0.0

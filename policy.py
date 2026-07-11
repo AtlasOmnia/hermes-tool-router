@@ -7,12 +7,16 @@ import logging
 import os
 import re
 import time
-from typing import Any, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 try:
     from .config import PLUGIN_NAME
+    from .classifier import call_with_hard_timeout
+    from .intent import INTENT_TOOLSETS, Intent, classify_intent
 except ImportError:  # pragma: no cover - direct loader fallback
     from config import PLUGIN_NAME
+    from classifier import call_with_hard_timeout
+    from intent import INTENT_TOOLSETS, Intent, classify_intent
 
 logger = logging.getLogger(__name__)
 
@@ -78,21 +82,27 @@ PLAIN_ANSWER_RE = re.compile(
 ROUTER_SYSTEM_PROMPT = """You are a tool-router classifier. Given a user message and a list of available toolsets with descriptions, predict which toolsets the AI assistant will need to respond.
 
 Rules:
-1. Return ONLY a JSON object with a single key "toolsets" containing an array of toolset names.
-2. Include ONLY toolsets directly relevant to the user's request.
-3. Do not include terminal, file, or web unless the request actually needs them.
-4. For ordinary questions that can be answered without tools, return an empty array.
-5. If the message is ambiguous or uncertain, return "all" as the only element.
-6. Be conservative; only include toolsets you are confident are needed.
+1. Return ONLY JSON: {"toolsets": ["name"], "confidence": 0.0}.
+2. confidence must be a number from 0.0 to 1.0.
+3. Include ONLY toolsets directly relevant to the user's request.
+4. Do not include terminal, file, or web unless the request actually needs them.
+5. For ordinary questions that can be answered without tools, return an empty array.
+6. If the message is ambiguous or uncertain, return "all" as the only toolset.
+7. Be conservative; only include toolsets you are confident are needed.
 Example response:
-{{"toolsets": ["terminal", "file", "web", "git"]}}
+{{"toolsets": ["terminal", "file"], "confidence": 0.96}}
 
 Available toolsets:
 {toolset_descriptions}
 
 User message: {user_message}
 """
-def _get_router_client(router_model: str, router_provider: str = "deepseek"):
+def _get_router_client(
+    router_model: str,
+    router_provider: str = "deepseek",
+    custom_base_url: str = "",
+    custom_api_key_env: str = "",
+):
     """Obtain an OpenAI-compatible client for the router.
 
     Supports:
@@ -132,6 +142,26 @@ def _get_router_client(router_model: str, router_provider: str = "deepseek"):
                     "HTTP-Referer": "https://github.com/hermes-agent/hermes-token-router",
                     "X-Title": "Hermes Tool Router",
                 },
+            )
+            return client, router_model
+
+        elif router_provider == "custom":
+            if not custom_base_url:
+                logger.debug("%s: custom classifier requires base_url", PLUGIN_NAME)
+                return None, None
+            api_key = os.environ.get(custom_api_key_env, "") if custom_api_key_env else "local"
+            if custom_api_key_env and not api_key:
+                logger.debug(
+                    "%s: custom classifier key env %s is unset",
+                    PLUGIN_NAME,
+                    custom_api_key_env,
+                )
+                return None, None
+            client = OpenAI(
+                api_key=api_key,
+                base_url=custom_base_url,
+                timeout=2,
+                max_retries=0,
             )
             return client, router_model
 
@@ -184,6 +214,17 @@ def _predict_toolsets_by_rules(
     if not lowered:
         return None, "empty"
 
+    intent_result = classify_intent(text)
+    if intent_result.intents == frozenset({Intent.ANSWER_ONLY}):
+        return set(), f"intent:{intent_result.reason_code}"
+    if Intent.FULL_SURFACE not in intent_result.intents:
+        intent_toolsets: Set[str] = set()
+        for intent in intent_result.intents:
+            intent_toolsets.update(INTENT_TOOLSETS.get(intent, frozenset()))
+        intent_toolsets &= available_toolsets
+        if intent_toolsets:
+            return intent_toolsets, f"intent:{intent_result.reason_code}"
+
     matched: Set[str] = set()
     matched_rules = 0
     for pattern, toolsets in TOOLSET_INTENT_RULES:
@@ -206,10 +247,10 @@ def _predict_toolsets_by_rules(
         return set(), "plain_default"
 
     return None, "needs_llm"
-def _extract_confidence(result: Any) -> float:
-    """Extract confidence from router output; return 1.0 when missing."""
+def _extract_confidence(result: Any) -> Optional[float]:
+    """Extract confidence from router output; missing confidence is unknown."""
     if not isinstance(result, dict):
-        return 1.0
+        return None
 
     for key in ("confidence", "probability", "prob", "score", "confidence_score"):
         raw = result.get(key)
@@ -235,13 +276,16 @@ def _extract_confidence(result: Any) -> float:
 
         return parsed
 
-    return 1.0
+    return None
 def _predict_toolsets_via_llm(
     user_message: str,
     available_toolsets: Set[str],
     router_model: str,
     confidence_threshold: float,
     router_provider: str = "deepseek",
+    hard_timeout_seconds: float = 1.2,
+    custom_base_url: str = "",
+    custom_api_key_env: str = "",
 ) -> Optional[Set[str]]:
     """Use the router model to predict which toolsets are needed.
 
@@ -249,7 +293,12 @@ def _predict_toolsets_via_llm(
     On any error, returns None for safe fallback.
     """
     try:
-        client, model = _get_router_client(router_model, router_provider)
+        client, model = _get_router_client(
+            router_model,
+            router_provider,
+            custom_base_url,
+            custom_api_key_env,
+        )
         if client is None:
             logger.debug(
                 "%s: router client unavailable — full set fallback",
@@ -273,30 +322,29 @@ def _predict_toolsets_via_llm(
             model,
         )
 
-        # Wrap in a thread with a hard timeout — prevent any hang
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                client.chat.completions.create,
+        def invoke_classifier():
+            return client.chat.completions.create(
                 model=model,
                 messages=[{"role": "system", "content": prompt}],
                 temperature=0.0,
                 max_tokens=200,
             )
-            try:
-                response = future.result(timeout=8)
-            except FutureTimeoutError:
+
+        try:
+            completed, response = call_with_hard_timeout(invoke_classifier, hard_timeout_seconds)
+            if not completed or response is None:
                 logger.warning(
-                    "%s: router prediction timed out after 8s — full set fallback",
+                    "%s: router prediction timed out after %.2fs — full set fallback",
                     PLUGIN_NAME,
+                    hard_timeout_seconds,
                 )
                 return None
-            except Exception as thread_exc:
-                logger.warning(
-                    "%s: router API call failed: %s — full set fallback",
-                    PLUGIN_NAME, thread_exc,
-                )
-                return None
+        except Exception as thread_exc:
+            logger.warning(
+                "%s: router API call failed: %s — full set fallback",
+                PLUGIN_NAME, thread_exc,
+            )
+            return None
         elapsed = time.monotonic() - start
 
         content = response.choices[0].message.content or ""
@@ -321,6 +369,9 @@ def _predict_toolsets_via_llm(
         predicted_list = result.get("toolsets", [])
 
         confidence = _extract_confidence(result)
+        if confidence is None:
+            logger.info("%s: router omitted confidence; keeping full toolset", PLUGIN_NAME)
+            return None
         if confidence < confidence_threshold:
             logger.info(
                 "%s: router confidence %.3f below threshold %.3f; keeping full toolset",

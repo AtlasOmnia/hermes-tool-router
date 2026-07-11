@@ -109,9 +109,6 @@ class _FakeRegistry:
     def get_entry(self, name):
         return self.entries.get(name)
 
-    def _snapshot_entries(self):
-        return list(self.entries.values())
-
 
 _FAKE_REGISTRY = _FakeRegistry()
 _fake_registry_module = types.ModuleType("tools.registry")
@@ -190,7 +187,8 @@ def _assert_route(prompt: str, expected_toolsets: set[str]) -> None:
 def test_recovery_schema_and_core_hook_surface():
     assert "request_toolset" == plugin.RECOVERY_TOOL_NAME
     assert plugin.RECOVERY_TOOL_SCHEMA["parameters"].get("additionalProperties") is False
-    assert "enum" in plugin.RECOVERY_TOOL_SCHEMA["parameters"]["properties"]["toolset"]
+    assert "toolsets" in plugin.RECOVERY_TOOL_SCHEMA["parameters"]["properties"]
+    assert plugin.RECOVERY_TOOL_SCHEMA["parameters"]["properties"]["toolsets"]["items"] == {"type": "string"}
     assert "tool_name" in plugin.RECOVERY_TOOL_SCHEMA["parameters"]["properties"]
     assert callable(plugin.pre_turn_context_build)
     assert callable(plugin.pre_llm_call)
@@ -200,7 +198,7 @@ def test_deterministic_routes():
     cases = [
         ("what is photosynthesis", {"request_toolset"}),
         ("check the hermes subreddit", {"web", "browser", "request_toolset"}),
-        ("open https://example.com and click the first link", {"web", "browser", "request_toolset"}),
+        ("open https://example.com and click the first link", {"browser", "request_toolset"}),
         ("latest weather today", {"web", "request_toolset"}),
         ("read this file", {"file", "request_toolset"}),
         ("run the shell test command", {"terminal", "request_toolset"}),
@@ -214,6 +212,24 @@ def test_deterministic_routes():
     ]
     for prompt, expected in cases:
         _assert_route(prompt, expected)
+
+
+def test_late_pre_llm_compatibility_routes_before_request_without_explicit_agent():
+    agent = _FakeAgent()
+    agent._current_turn_id = "late-turn"
+
+    def invoke_from_turn_context_stack():
+        # The local variable name intentionally matches Hermes build_turn_context.
+        return plugin.pre_llm_call(
+            session_id=agent.session_id,
+            turn_id=agent._current_turn_id,
+            user_message="latest weather today",
+            conversation_history=[],
+            is_first_turn=True,
+        )
+
+    invoke_from_turn_context_stack()
+    assert _exposed_toolsets(agent) == {"web", "request_toolset"}
 
 
 def test_pre_llm_call_skips_after_core_hook_routed_turn():
@@ -246,6 +262,18 @@ def test_pre_llm_call_skips_after_core_hook_routed_turn():
     assert agent.valid_tool_names == before_names
 
 
+def test_tool_request_middleware_expands_registered_pruned_tool_before_validation():
+    agent = _route("what is photosynthesis")
+    assert "git_status" not in agent.valid_tool_names
+    result = plugin.tool_request_middleware(
+        session_id=agent.session_id,
+        tool_name="git_status",
+        args={"short": True},
+    )
+    assert result == {"args": {"short": True}, "router_recovered": "git"}
+    assert "git_status" in agent.valid_tool_names
+
+
 def test_request_toolset_git_expansion():
     agent = _route("what is photosynthesis")
     assert _exposed_toolsets(agent) == {"request_toolset"}
@@ -262,6 +290,30 @@ def test_request_toolset_unknown_suggestion():
     assert response["error"].startswith("unknown toolset")
     assert "suggestions" in response
     assert "git" in response["suggestions"]
+
+
+def test_first_turn_surface_is_sticky_and_does_not_shrink_or_reclassify():
+    agent = _FakeAgent()
+    agent._current_turn_id = "turn-one"
+    plugin.pre_turn_context_build(
+        agent=agent,
+        turn_id="turn-one",
+        user_message="latest weather today",
+        conversation_history=[],
+        is_first_turn=True,
+    )
+    first_names = set(agent.valid_tool_names)
+    assert "web_search" in first_names
+
+    agent._current_turn_id = "turn-two"
+    plugin.pre_turn_context_build(
+        agent=agent,
+        turn_id="turn-two",
+        user_message="read this file",
+        conversation_history=[{"role": "user", "content": "latest weather today"}],
+        is_first_turn=False,
+    )
+    assert agent.valid_tool_names == first_names
 
 
 if __name__ == "__main__":
