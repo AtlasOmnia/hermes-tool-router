@@ -1,0 +1,21 @@
+{
+  "repo_path": ".",
+  "proposal_command": ["/usr/bin/true"],
+  "evaluator_command": [
+    ".venv/bin/python",
+    "scripts/live_router_evaluator.py",
+    "--output",
+    "runs/autoresearch_live_router_eval.json"
+  ],
+  "max_trials": 1,
+  "max_seconds": 1800,
+  "stop_after_no_improve": 1,
+  "min_improvement": 0.0,
+  "keep_on_improve": true,
+  "revert_on_no_improve": false,
+  "revert_on_failure": false,
+  "allowlist_relative_paths": ["intent.py", "policy.py", "config.py", "tests", "benchmarks", "scripts", "runs"],
+  "tsv_log_path": "runs/autoresearch_experiments.tsv",
+  "jsonl_log_path": "runs/autoresearch_experiments.jsonl",
+  "command_timeout_seconds": 1700
+}

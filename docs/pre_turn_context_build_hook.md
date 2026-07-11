@@ -1,10 +1,10 @@
 # Proposal: `pre_turn_context_build` Hook for Hermes
 
-## Status: Implemented
+## Status: Version-dependent
 
-Implemented in Hermes core on 2026-07-01. The core hook now fires from `agent/turn_context.py` before system prompt assembly, skill injection/filtering, preflight token estimate/compression, and final provider tool schema assembly. The token-router plugin now registers `pre_turn_context_build` as its primary routing hook and no longer monkey-patches `agent.turn_context.build_turn_context`.
+The hook existed in a July 1, 2026 Hermes build but is not present in every later/current hook registry. The plugin therefore supports stock `pre_llm_call` as a compatibility route and uses live diagnostics rather than version strings. This document remains the proposal for a cleaner explicit-agent, pre-preflight surface.
 
-Minimum Hermes requirement for primary routing: a Hermes build containing the 2026-07-01 `pre_turn_context_build` hook in `agent/turn_context.py` and the matching valid-hook entry in `hermes_cli/plugins.py`. Older Hermes builds continue through the plugin's late `pre_llm_call` fallback, but that fallback cannot reduce prompt/tool schema bloat before turn-context assembly.
+Minimum Hermes requirement for the clean pre-preflight path: a build containing `pre_turn_context_build` (or an equivalent early surface hook) and its valid-hook registry entry. Builds exposing only `pre_llm_call` use the stock late compatibility path, which still narrows the actual provider request but cannot change work already performed by the initial preflight stage.
 
 ## Summary
 

@@ -10,8 +10,8 @@ logger = logging.getLogger(__name__)
 
 PLUGIN_NAME = "hermes-token-router"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.yaml"
-DEFAULT_ROUTER_MODEL = "meta-llama/llama-3.1-8b-instruct"
-DEFAULT_ROUTER_PROVIDER = "openrouter"
+DEFAULT_ROUTER_MODEL = "deepseek-chat"
+DEFAULT_ROUTER_PROVIDER = "deepseek"
 def _load_config() -> dict:
     """Load router config from plugin's config.yaml.
 
@@ -37,27 +37,16 @@ def _get_profile_config(cfg: dict) -> dict:
     if explicit_profile:
         profile_name = explicit_profile
     else:
-        # No explicit profile env; prefer any enabled profile in our config.
-        # This lets the router work even when Hermes doesn't export HERMES_PROFILE.
-        profiles_cfg = cfg.get("profiles", {}) or {}
-        candidate = next(
-            (name for name, v in profiles_cfg.items() if v.get("enabled")),
-            None,
-        )
-
-        # Fallback: infer from HERMES_HOME path.
+        # No explicit profile env: infer only from the canonical Hermes home.
+        # Never activate the first enabled profile by insertion order; applying
+        # another profile's policy is less safe than failing closed here.
         hermes_home = os.environ.get("HERMES_HOME", "")
         inferred = "default"
         if hermes_home:
-            profiles_root = Path(hermes_home).parent / "profiles"
-            if profiles_root.exists():
-                for child in profiles_root.iterdir():
-                    if child.is_dir() and str(child.resolve()) == Path(hermes_home).resolve():
-                        inferred = child.name
-                        break
-
-        # Use enabled config profile if present; else use inferred.
-        profile_name = candidate or inferred
+            home_path = Path(hermes_home).expanduser().resolve()
+            if home_path.parent.name == "profiles":
+                inferred = home_path.name
+        profile_name = inferred
 
     # Look up per-profile config
     profiles_config = cfg.get("profiles", {})
@@ -73,20 +62,48 @@ def _get_profile_config(cfg: dict) -> dict:
 
     # Not enabled for this profile
     return {"enabled": False, "_profile_name": profile_name}
+def _is_classifier_enabled(profile_cfg: dict) -> bool:
+    """The external classifier is opt-in; deterministic routing works without it."""
+    classifier = profile_cfg.get("classifier", {})
+    return bool(isinstance(classifier, dict) and classifier.get("enabled", False))
+
+
+def _get_classifier_connection(profile_cfg: dict) -> tuple[str, str]:
+    """Return custom OpenAI-compatible base URL and API-key env name."""
+    classifier = profile_cfg.get("classifier", {})
+    if not isinstance(classifier, dict):
+        return "", ""
+    base_url = classifier.get("base_url")
+    api_key_env = classifier.get("api_key_env")
+    return (
+        base_url.strip() if isinstance(base_url, str) else "",
+        api_key_env.strip() if isinstance(api_key_env, str) else "",
+    )
+
+
 def _get_router_model(profile_cfg: dict) -> str:
-    """Return the effective router model from config."""
-    router_model = profile_cfg.get("router_model", DEFAULT_ROUTER_MODEL)
+    """Return the effective classifier model (v2 nested config, then legacy)."""
+    classifier = profile_cfg.get("classifier", {})
+    nested = classifier.get("model") if isinstance(classifier, dict) else None
+    router_model = nested or profile_cfg.get("router_model", DEFAULT_ROUTER_MODEL)
     if not isinstance(router_model, str) or not router_model.strip():
         return DEFAULT_ROUTER_MODEL
     return router_model.strip()
 def _get_router_provider(profile_cfg: dict) -> str:
-    """Return the effective router provider from config."""
-    router_provider = profile_cfg.get("router_provider", DEFAULT_ROUTER_PROVIDER)
+    """Return the effective classifier provider (v2 nested config, then legacy)."""
+    classifier = profile_cfg.get("classifier", {})
+    nested = classifier.get("provider") if isinstance(classifier, dict) else None
+    router_provider = nested or profile_cfg.get("router_provider", DEFAULT_ROUTER_PROVIDER)
     if not isinstance(router_provider, str) or not router_provider.strip():
         return DEFAULT_ROUTER_PROVIDER
     return router_provider.strip()
 def _is_router_active(cfg: dict = None) -> bool:
-    """Check if router is enabled for the current profile."""
+    """Check if router is enabled for the current profile or process override."""
+    override = os.environ.get("HERMES_TOKEN_ROUTER_ENABLED", "").strip().lower()
+    if override in {"0", "false", "no", "off"}:
+        return False
+    if override in {"1", "true", "yes", "on"}:
+        return True
     if cfg is None:
         cfg = _load_config()
     profile_cfg = _get_profile_config(cfg)

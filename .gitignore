@@ -3,6 +3,12 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.venv/
+build/
+dist/
+dist-*/
+*.egg-info/
+runs/
 .DS_Store
 .env
 .env.*

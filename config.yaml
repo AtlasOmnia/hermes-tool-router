@@ -1,21 +1,27 @@
-# Hermes Tool Router configuration
-# Copy this file with the plugin and enable either global or selected profiles.
-# Safe default: disabled until you opt in.
-
+# Hermes Tool Router v2 configuration — disabled until explicitly enabled.
 global:
   enabled: false
-  # floor_toolsets are always kept when routing narrows the tool surface.
-  # Set [] for maximum token savings and rely on request_toolset recovery.
-  floor_toolsets: [terminal, file, web]
+  routing_scope: first_turn
+  expansion_mode: monotonic
+  shrink_mid_session: false
+  floor_toolsets: []
   deterministic_rules_enabled: true
-  confidence_threshold: 0.0
-  long_message_decline_chars: 12000
-  short_message_bypass_chars: 0
-  router_provider: deepseek
-  router_model: deepseek-chat
+  confidence_threshold: 0.90
+  router_timeout_ms: 750
+  router_hard_timeout_ms: 1200
+  fail_open: true
+  auto_recover_registered_tools: true
+  classifier:
+    enabled: false
+    provider: null  # defaults to direct deepseek when enabled
+    model: null     # defaults to deepseek-chat
+    base_url: null
+    api_key_env: null
+  metrics:
+    enabled: true
+    local_only: true
+    retain_days: 30
 
 profiles:
-  # Example profile-specific override. Rename "router-test" to your test profile name.
   router-test:
     enabled: false
-    floor_toolsets: [terminal, file, web]

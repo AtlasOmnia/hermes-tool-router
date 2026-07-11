@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import difflib
-import json
 import logging
 from typing import Any, Dict, List, Optional, Set
 
@@ -21,40 +19,41 @@ logger = logging.getLogger(__name__)
 RECOVERY_TOOL_NAME = "request_toolset"
 RECOVERY_TOOLSET = "router_recovery"
 RECOVERY_TOOLSET_CHOICES = sorted(TOOLSET_DESCRIPTIONS)
-RECOVERY_TOOL_SCHEMA: Dict[str, Any] = {
-    "description": (
-        "Request an additional toolset to recover when a required capability "
-        "was filtered out by token-router. Call this only when a needed tool "
-        "is missing from the current tool list."
-    ),
-    "parameters": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "toolset": {
-                "type": "string",
-                "description": (
-                    "Add one Hermes toolset that is missing from the currently "
-                    "active set, usually because token-router pruning narrowed "
-                    "tools. Use exactly one toolset name per call."
-                ),
-                "enum": RECOVERY_TOOLSET_CHOICES,
-            },
-            "tool_name": {
-                "type": "string",
-                "description": (
-                    "Optional specific tool the model needs; the plugin will "
-                    "try to resolve its owning toolset."
-                ),
-            },
-            "reason": {
-                "type": "string",
-                "description": "Optional short rationale for logs/traceability.",
-                "maxLength": 200,
+
+
+def build_recovery_tool_schema(available_toolsets: Set[str]) -> Dict[str, Any]:
+    """Build the compact recovery schema from the live registry surface."""
+    return {
+        "description": "Load missing Hermes toolsets before continuing the task.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "toolsets": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "uniqueItems": True,
+                    "description": (
+                        "One or more Hermes toolset names to add for this session, such as "
+                        "file, terminal, web, browser, computer_use, vision, image_gen, "
+                        "video, video_gen, memory, skills, session_search, cronjob, "
+                        "delegation, tts, or code_execution. Names are validated against "
+                        "the live registry when called."
+                    ),
+                },
+                "tool_name": {
+                    "type": "string",
+                    "description": "Optional registered tool whose owner toolset should be loaded.",
+                },
+                "reason": {"type": "string", "maxLength": 200},
             },
         },
-    },
-}
+    }
+
+
+# Import-time fallback; register() rebuilds this from the live registry.
+RECOVERY_TOOL_SCHEMA: Dict[str, Any] = build_recovery_tool_schema(set(RECOVERY_TOOLSET_CHOICES))
 def _resolve_toolset_to_tool_names(toolsets: Set[str]) -> Set[str]:
     """Resolve a set of toolset names to tool names via the registry."""
     tool_names: Set[str] = set()
@@ -156,11 +155,13 @@ def _detect_missing_toolset(
     except Exception:
         return None
 def _get_all_tool_names() -> Set[str]:
-    """Get ALL tool names from the registry."""
+    """Get all registered tool names through public toolset APIs."""
     try:
         from tools.registry import registry
-        entries = registry._snapshot_entries()
-        return {e.name for e in entries}
+        names: Set[str] = set()
+        for toolset in registry.get_registered_toolset_names():
+            names.update(registry.get_tool_names_for_toolset(toolset) or [])
+        return names
     except Exception:
         return set()
 def _cache_full_toolset(agent: Any) -> None:
@@ -294,6 +295,7 @@ def _expand_toolset(agent: Any, toolset_name: str) -> None:
 
         # Get current predicted toolsets
         state = _get_router_state(agent)
+        state.expand_surface({toolset_name})
         if state.predicted_toolsets is not None:
             state.predicted_toolsets.add(toolset_name)
         else:

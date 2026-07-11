@@ -1,13 +1,15 @@
 name: hermes-token-router
-version: 0.1.0
-description: "Hermes Tool Router — pre-turn toolset prediction with request_toolset recovery. Narrows tool schemas to reduce prompt token overhead, then expands safely on demand."
+version: 0.2.0-rc1
+description: "First-turn, session-sticky Hermes tool-surface routing with monotonic recovery."
 author: "Jonathan Rivera"
 license: MIT
 kind: standalone
 requires_env: []
 provides_hooks:
-  - pre_turn_context_build
   - pre_llm_call
   - post_tool_call
+  - on_session_end
+provides_middleware:
+  - tool_request
 provides_tools:
   - request_toolset
