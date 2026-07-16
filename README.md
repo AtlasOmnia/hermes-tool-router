@@ -4,6 +4,14 @@ Experimental standalone Hermes Agent plugin for reducing first-turn tool-schema 
 
 > Test on a separate Hermes profile first. Do not install an experimental router directly on a primary profile.
 
+## How it works
+
+<p align="center">
+  <img src="docs/tool-router-flow.svg" alt="Hermes Tool Router flow: classify the first turn, narrow the tool schema when confidence is high, fail open when uncertain, and add missing toolsets permanently for the session." width="100%">
+</p>
+
+The router classifies only the first turn. High-confidence routes send a smaller tool schema to the main model; uncertainty keeps the full surface. If a pruned registered tool is needed later, Hermes adds its owning toolset without re-pruning the session.
+
 ## v0.2 design
 
 - **First-turn routing:** deterministic intent classification narrows the live tool surface before the first provider request through stock Hermes hooks.
