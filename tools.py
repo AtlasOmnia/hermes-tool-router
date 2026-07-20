@@ -84,7 +84,29 @@ def _resolve_toolset_to_tool_names(toolsets: Set[str]) -> Set[str]:
                 "%s: failed to resolve toolset '%s': %s",
                 PLUGIN_NAME, ts, exc,
             )
-    return tool_names
+
+    if not tool_names:
+        return tool_names
+
+    try:
+        definitions = registry.get_definitions(tool_names, quiet=True) or []
+        materialized_names = {
+            definition.get("function", {}).get("name", "")
+            for definition in definitions
+        }
+        materialized_names.discard("")
+        dropped_names = tool_names - materialized_names
+        if dropped_names:
+            logger.debug(
+                "%s: dropped %d unmaterialized tool name(s): %s",
+                PLUGIN_NAME,
+                len(dropped_names),
+                sorted(dropped_names)[:10],
+            )
+        return materialized_names
+    except Exception as exc:
+        logger.debug("%s: materialization filter skipped: %s", PLUGIN_NAME, exc)
+        return tool_names
 def _filter_tool_definitions(
     tool_defs: List[Dict[str, Any]],
     allowed_tool_names: Set[str],
