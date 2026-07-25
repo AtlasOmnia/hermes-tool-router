@@ -12,7 +12,11 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[PKG] = module
 spec.loader.exec_module(module)
 
-from hermes_tool_router_policy_v2_test.policy import _extract_confidence, _predict_toolsets_by_rules
+from hermes_tool_router_policy_v2_test.policy import (
+    ROUTER_SYSTEM_PROMPT,
+    _extract_confidence,
+    _predict_toolsets_by_rules,
+)
 
 
 AVAILABLE = {"web", "browser", "file", "terminal", "vision", "image_gen", "video", "video_gen"}
@@ -31,3 +35,14 @@ def test_policy_uses_minimum_toolset_for_url_summary():
 
 def test_missing_classifier_confidence_is_unknown_not_perfect():
     assert _extract_confidence({"toolsets": ["web"]}) is None
+
+
+def test_classifier_prompt_formats_literal_json_contract():
+    prompt = ROUTER_SYSTEM_PROMPT.format(
+        toolset_descriptions="  - web: current web data",
+        user_message="What is the weather right now?",
+    )
+
+    assert 'Return ONLY JSON: {"toolsets": ["name"], "confidence": 0.0}.' in prompt
+    assert '{"toolsets": ["terminal", "file"], "confidence": 0.96}' in prompt
+    assert 'Personal calendar, itinerary, reservation, or flight-detail lookups require "skills" and "terminal"' in prompt
