@@ -263,7 +263,17 @@ def _route_tool_surface(source: str, agent: Any = None, **kwargs: Any) -> Option
     predicted: Optional[Set[str]]
     deterministic_enabled = bool(profile_cfg.get("deterministic_rules_enabled", True))
     rule_reason = "disabled"
-    if deterministic_enabled:
+    # Empty and period/ellipsis-only probes carry no actionable intent. Route
+    # them deterministically even on classifier-first profiles: asking a
+    # stochastic model to interpret "." can yield a low-confidence "all"
+    # response, and the safe fail-open then defeats the smallest-surface smoke
+    # test. Other symbols and emoji remain ambiguous and keep the normal
+    # classifier/fail-open path.
+    probe_chars = {char for char in user_message if not char.isspace()}
+    if not probe_chars or probe_chars <= {".", "…"}:
+        predicted = set()
+        rule_reason = "empty_or_period_probe"
+    elif deterministic_enabled:
         predicted, rule_reason = _predict_toolsets_by_rules(user_message, available)
     else:
         predicted = None
