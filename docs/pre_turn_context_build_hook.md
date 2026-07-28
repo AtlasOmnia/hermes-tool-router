@@ -14,7 +14,7 @@ This hook would let plugins such as `hermes-token-router` adjust the active tool
 
 ## Motivation
 
-The Edith token-router currently needs to reduce tool schema bloat before the main LLM request is built. Today it does that with a plugin-side runtime wrapper around `build_turn_context`. The wrapper is intentionally fail-open and guarded by `inspect.signature`, but it still depends on Hermes internals:
+The test-profile token-router currently needs to reduce tool schema bloat before the main LLM request is built. Today it does that with a plugin-side runtime wrapper around `build_turn_context`. The wrapper is intentionally fail-open and guarded by `inspect.signature`, but it still depends on Hermes internals:
 
 - positional argument order in `build_turn_context`;
 - `summarize_user_message_for_log` being passed as a keyword argument;
@@ -92,7 +92,7 @@ For the first implementation, `None` is enough. It matches current hook style an
 
 ## Current Wrapper vs. Clean Hook
 
-Current experimental Edith shim:
+Current experimental test-profile shim:
 
 ```text
 plugin register()

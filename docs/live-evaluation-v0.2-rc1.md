@@ -2,7 +2,7 @@
 
 Date: 2026-07-11
 
-Profile: `edith` (isolated test profile)
+Profile: `router-test` (isolated test profile)
 
 Model: `openai/gpt-5.4-mini` through OpenRouter
 
@@ -22,7 +22,7 @@ An optional earlier hook could reduce internal preflight work, but it is not req
 
 ## Paired methodology
 
-The evaluator launches fresh Edith sessions with the same profile and prompt in two modes:
+The evaluator launches fresh test-profile sessions with the same profile and prompt in two modes:
 
 1. Router enabled.
 2. Router bypassed for that subprocess with `HERMES_TOKEN_ROUTER_ENABLED=false`.

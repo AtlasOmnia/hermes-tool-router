@@ -41,9 +41,9 @@ def test_explicit_profile_is_respected(monkeypatch):
 def test_process_override_can_disable_router_for_ab_evaluation(monkeypatch):
     from hermes_tool_router_config_test.config import _is_router_active
 
-    monkeypatch.setenv("HERMES_PROFILE", "edith")
+    monkeypatch.setenv("HERMES_PROFILE", "router-test")
     monkeypatch.setenv("HERMES_TOKEN_ROUTER_ENABLED", "false")
-    assert _is_router_active({"profiles": {"edith": {"enabled": True}}}) is False
+    assert _is_router_active({"profiles": {"router-test": {"enabled": True}}}) is False
 
 
 def test_classifier_is_opt_in():

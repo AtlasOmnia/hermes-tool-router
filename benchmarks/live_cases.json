@@ -15,10 +15,10 @@
   },
   {
     "id": "file",
-    "prompt": "Read /tmp/router-edith-probe.txt and return its exact contents only.",
+    "prompt": "Read /tmp/router-test-probe.txt and return its exact contents only.",
     "expected_toolsets": ["file"],
     "expected_tools": ["read_file"],
-    "must_contain": ["EDITH_ROUTER_PROBE_OK"]
+    "must_contain": ["ROUTER_TEST_PROBE_OK"]
   },
   {
     "id": "web",
@@ -43,7 +43,7 @@
   },
   {
     "id": "session_search",
-    "prompt": "Use session search to find the previous Edith session where Tampa weather was tested. Return its session ID only.",
+    "prompt": "Use session search to find the previous test-profile session where weather lookup was tested. Return its session ID only.",
     "expected_toolsets": ["session_search"],
     "expected_tools": ["session_search"],
     "must_contain": []
