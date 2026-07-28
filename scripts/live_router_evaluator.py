@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paired live Edith evaluator for hermes-token-router."""
+"""Paired live test-profile evaluator for hermes-token-router."""
 
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ FIRST_INPUT_RE = re.compile(r"API call #1:.*?\bin=(\d+)")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--profile", default="edith")
+    parser.add_argument("--profile", default="router-test")
     parser.add_argument("--cases", type=Path, default=Path(__file__).resolve().parents[1] / "benchmarks/live_cases.json")
-    parser.add_argument("--state-db", type=Path, default=Path.home() / ".hermes/profiles/edith/state.db")
-    parser.add_argument("--agent-log", type=Path, default=Path.home() / ".hermes/profiles/edith/logs/agent.log")
+    parser.add_argument("--state-db", type=Path, default=Path.home() / ".hermes/profiles/router-test/state.db")
+    parser.add_argument("--agent-log", type=Path, default=Path.home() / ".hermes/profiles/router-test/logs/agent.log")
     parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[1] / "runs/live_router_eval.json")
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--baseline-cases", default="answer_only,terminal,web")
@@ -125,7 +125,7 @@ def main() -> int:
     if args.max_cases > 0:
         cases = cases[: args.max_cases]
     baseline_ids = {item.strip() for item in args.baseline_cases.split(",") if item.strip()}
-    Path("/tmp/router-edith-probe.txt").write_text("EDITH_ROUTER_PROBE_OK\n")
+    Path("/tmp/router-test-probe.txt").write_text("ROUTER_TEST_PROBE_OK\n")
 
     results: list[dict[str, Any]] = []
     for case in cases:
@@ -183,7 +183,7 @@ def main() -> int:
     payload = {
         "score": round(score, 6),
         "accepted": route_recall == 1.0 and tool_success >= 0.9 and answer_accuracy >= 0.9,
-        "reason": f"live Edith router evaluation: {sum(bool(r.get('case_passed')) for r in routed)}/{len(routed)} cases passed",
+        "reason": f"live test-profile router evaluation: {sum(bool(r.get('case_passed')) for r in routed)}/{len(routed)} cases passed",
         "metrics": metrics,
         "results": results,
     }

@@ -101,7 +101,7 @@ Against the live 39-tool Hermes registry, Hermes's own rough request estimator m
 
 See [`docs/baselines/v0.2-rc1.md`](docs/baselines/v0.2-rc1.md) for commands and caveats. These are estimator results, not provider billing receipts.
 
-## Live Edith A/B validation
+## Live test-profile A/B validation
 
 A paired full-tools-versus-routed evaluation using `openai/gpt-5.4-mini` produced:
 

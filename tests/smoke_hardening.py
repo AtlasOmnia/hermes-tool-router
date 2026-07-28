@@ -214,6 +214,32 @@ def test_deterministic_routes():
         _assert_route(prompt, expected)
 
 
+def test_inert_period_probes_skip_classifier_without_capturing_symbols(monkeypatch):
+    monkeypatch.setitem(_TEST_CONFIG["global"], "deterministic_rules_enabled", False)
+    monkeypatch.setitem(
+        _TEST_CONFIG["global"],
+        "classifier",
+        {"enabled": True, "provider": "openrouter", "model": "fake-router"},
+    )
+
+    classified = []
+
+    def record_classifier(user_message, *args, **kwargs):
+        classified.append(user_message)
+        return None
+
+    monkeypatch.setattr(plugin, "_predict_toolsets_via_llm", record_classifier)
+    for prompt in (".", "...", "…", "   ", ". ."):
+        agent = _route(prompt)
+        assert _exposed_toolsets(agent) == {"request_toolset"}
+    assert classified == []
+
+    for prompt in ("?", "🖼️"):
+        agent = _route(prompt)
+        assert classified[-1] == prompt
+        assert "web" in _exposed_toolsets(agent)
+
+
 def test_late_pre_llm_compatibility_routes_before_request_without_explicit_agent():
     agent = _FakeAgent()
     agent._current_turn_id = "late-turn"
