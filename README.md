@@ -12,6 +12,41 @@ Experimental standalone Hermes Agent plugin for reducing first-turn tool-schema 
 
 The router classifies only the first turn. High-confidence routes send a smaller tool schema to the main model; uncertainty keeps the full surface. If a pruned registered tool is needed later, Hermes adds its owning toolset without re-pruning the session.
 
+## Recommended: add a fast OpenRouter classifier
+
+The router works without an API key, but deterministic rules cannot recognize every request. When a request is ambiguous, the safe fallback is to send the entire tool catalog to the main model. That preserves capability but gives up much of the speed and token benefit.
+
+> **For the best routing quality and responsiveness, connect a fast OpenRouter classifier.** For ambiguous first-turn requests, model classification is typically more accurate than deterministic-only routing: it can recognize intent that rules miss, select a smaller and more relevant tool surface, and help the main model choose the correct tools. Avoiding full-catalog fallbacks often reduces first-response latency and input-token cost.
+
+OpenRouter is used only for the small first-turn classification request; it does not replace your main Hermes model. The router still fails open to the complete toolset if the classifier is unavailable, slow, malformed, or below the confidence threshold.
+
+### OpenRouter quick setup
+
+1. Create an [OpenRouter API key](https://openrouter.ai/settings/keys).
+2. Add it to the environment used by Hermes:
+
+   ```bash
+   export OPENROUTER_API_KEY="your-openrouter-api-key"
+   ```
+
+3. Enable model-driven routing in `config.yaml`:
+
+   ```yaml
+   global:
+     deterministic_rules_enabled: false
+     confidence_threshold: 0.90
+     router_hard_timeout_ms: 2000
+     fail_open: true
+     classifier:
+       enabled: true
+       provider: openrouter
+       model: google/gemini-3.5-flash-lite
+   ```
+
+`google/gemini-3.5-flash-lite` is a verified low-latency example for this bounded JSON classification task. Model speed and behavior change over time, so benchmark the exact model and timeout before a production rollout. If you prefer rule-first routing, leave `deterministic_rules_enabled: true`; OpenRouter will then be used only when the deterministic policy returns no decision.
+
+The classifier adds one short network request, so it is not a universal latency guarantee. The gain comes when better routing avoids sending a much larger tool schema to the main model.
+
 ## v0.2 design
 
 - **First-turn routing:** deterministic intent classification narrows the live tool surface before the first provider request through stock Hermes hooks.
@@ -69,7 +104,7 @@ global:
     enabled: false
 ```
 
-The classifier remains opt-in because adding a network request before every uncertain main-model call can erase latency gains. When disabled, unresolved deterministic requests keep all tools. Direct DeepSeek is the default hosted classifier; OpenRouter is used only when explicitly selected. A local OpenAI-compatible endpoint can be configured as:
+The classifier remains opt-in because network latency, model behavior, and cost vary by deployment. For users prioritizing routing quality and fewer full-tool fallbacks, the OpenRouter setup above is recommended. When the classifier is disabled, unresolved deterministic requests safely keep all tools. Direct DeepSeek is the default hosted classifier when no provider is selected; OpenRouter is used only when explicitly configured. A local OpenAI-compatible endpoint can be configured as:
 
 ```yaml
 classifier:
