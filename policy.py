@@ -82,13 +82,14 @@ PLAIN_ANSWER_RE = re.compile(
 ROUTER_SYSTEM_PROMPT = """You are a tool-router classifier. Given a user message and a list of available toolsets with descriptions, predict which toolsets the AI assistant will need to respond.
 
 Rules:
-1. Return ONLY JSON: {"toolsets": ["name"], "confidence": 0.0}.
+1. Return ONLY JSON: {{"toolsets": ["name"], "confidence": 0.0}}.
 2. confidence must be a number from 0.0 to 1.0.
 3. Include ONLY toolsets directly relevant to the user's request.
 4. Do not include terminal, file, or web unless the request actually needs them.
 5. For ordinary questions that can be answered without tools, return an empty array.
 6. If the message is ambiguous or uncertain, return "all" as the only toolset.
 7. Be conservative; only include toolsets you are confident are needed.
+8. Personal calendar, itinerary, reservation, or flight-detail lookups require "skills" and "terminal" when those toolsets are available.
 Example response:
 {{"toolsets": ["terminal", "file"], "confidence": 0.96}}
 
