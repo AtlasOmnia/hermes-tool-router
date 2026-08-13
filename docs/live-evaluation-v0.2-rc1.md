@@ -70,10 +70,10 @@ Direct evaluator:
   --output runs/live_router_eval.json
 ```
 
-Through `hermes-autoresearch`:
+Through the `hermes-loops` autoresearch harness:
 
 ```bash
-PYTHONPATH=~/Desktop/hermes-autoresearch/src \
+PYTHONPATH=<hermes-loops checkout>/autoresearch/src \
   .venv/bin/python -m hermes_autoresearch.cli \
   --config autoresearch/router_live_eval.json
 ```
