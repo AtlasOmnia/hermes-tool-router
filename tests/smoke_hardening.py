@@ -194,6 +194,34 @@ def test_recovery_schema_and_core_hook_surface():
     assert callable(plugin.pre_llm_call)
 
 
+def test_incomplete_registered_recovery_fails_open():
+    names = (
+        "_registration_checked",
+        "_recovery_middleware_registered",
+        "_recovery_tool_registered",
+    )
+    original = {name: plugin.__dict__[name] for name in names}
+    try:
+        plugin.__dict__.update({
+            "_registration_checked": True,
+            "_recovery_middleware_registered": False,
+            "_recovery_tool_registered": True,
+        })
+        agent = _FakeAgent()
+        plugin.pre_turn_context_build(
+            agent=agent,
+            turn_id="recovery-missing",
+            user_message="latest weather today",
+            conversation_history=[],
+            is_first_turn=True,
+        )
+        assert "web_search" in agent.valid_tool_names
+        assert "read_file" in agent.valid_tool_names
+        assert "shell" in agent.valid_tool_names
+    finally:
+        plugin.__dict__.update(original)
+
+
 def test_deterministic_routes():
     cases = [
         ("what is photosynthesis", {"request_toolset"}),

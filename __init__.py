@@ -126,6 +126,22 @@ except ImportError:  # pragma: no cover - direct loader fallback
 
 logger = logging.getLogger(__name__)
 
+# Registration is checked at plugin startup. If a Hermes update removes either
+# recovery mechanism, routing must fail open rather than leave a narrowed
+# surface that cannot reliably add a missed capability.
+_registration_checked = False
+_recovery_middleware_registered = False
+_recovery_tool_registered = False
+
+
+def _recovery_is_ready() -> bool:
+    """Return whether a registered runtime can safely narrow tool schemas."""
+    # Direct-import test harnesses do not call register(); preserve their
+    # isolated behavior. A real plugin runtime always marks registration.
+    if not _registration_checked:
+        return True
+    return _recovery_middleware_registered and _recovery_tool_registered
+
 
 def _mark_turn_routed(agent: Any, state: RouterState, turn_id: str, source: str) -> None:
     """Record that this agent/turn already passed through the router."""
@@ -179,6 +195,16 @@ def _route_tool_surface(source: str, agent: Any = None, **kwargs: Any) -> Option
 
     turn_id = kwargs.get("turn_id") or getattr(agent, "_current_turn_id", "") or ""
     state = _get_router_state(agent)
+
+    if not _recovery_is_ready():
+        _restore_full_tools(agent)
+        state.active = False
+        state.predicted_toolsets = None
+        logger.warning(
+            "%s: recovery registration incomplete; keeping full tool surface",
+            PLUGIN_NAME,
+        )
+        return None
 
     # Production policy: classify only the initial tool surface. Later turns
     # reuse the session-sticky surface so tool schemas remain cache-stable.
@@ -495,6 +521,11 @@ def register(ctx) -> None:
       - post_tool_call         : best-effort expansion after executed tool calls
     """
 
+    global _registration_checked, _recovery_middleware_registered, _recovery_tool_registered
+    _registration_checked = True
+    _recovery_middleware_registered = False
+    _recovery_tool_registered = False
+
     try:
         from hermes_cli.plugins import VALID_HOOKS
         if "pre_turn_context_build" in VALID_HOOKS:
@@ -507,6 +538,7 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_end", on_session_end)
     try:
         ctx.register_middleware("tool_request", tool_request_middleware)
+        _recovery_middleware_registered = True
     except Exception as exc:
         logger.warning("%s: tool_request middleware unavailable: %s", PLUGIN_NAME, exc)
 
@@ -521,12 +553,15 @@ def register(ctx) -> None:
             description=recovery_schema["description"],
             emoji="",
         )
+        _recovery_tool_registered = True
     except Exception as exc:
         logger.warning("%s: failed to register recovery tool: %s", PLUGIN_NAME, exc)
 
     logger.info(
-        "%s plugin registered (routing: pre_llm_call compatibility; middleware: tool_request; tool: request_toolset)",
+        "%s plugin registered (routing: pre_llm_call compatibility; middleware: %s; tool: %s)",
         PLUGIN_NAME,
+        _recovery_middleware_registered,
+        _recovery_tool_registered,
     )
 
 
