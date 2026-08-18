@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -35,10 +36,10 @@ def parse_args() -> argparse.Namespace:
 def run_case(profile: str, case: dict[str, Any], routed: bool, timeout: int) -> dict[str, Any]:
     env = os.environ.copy()
     env["HERMES_TOKEN_ROUTER_ENABLED"] = "true" if routed else "false"
-    prompt = case["prompt"].replace(
-        "{{HERMES_PYTHON}}",
-        str(Path.home() / ".hermes/hermes-agent/.venv/bin/python"),
-    )
+    # Exercise the interpreter running this evaluator rather than assuming a
+    # historical Hermes virtualenv layout. Install methods and CI runners may
+    # place the executable elsewhere.
+    prompt = case["prompt"].replace("{{HERMES_PYTHON}}", sys.executable)
     started = time.monotonic()
     proc = subprocess.run(
         ["hermes", "--profile", profile, "chat", "-q", prompt],
@@ -122,6 +123,14 @@ def evaluate_case(case: dict[str, Any], run: dict[str, Any]) -> None:
 def main() -> int:
     args = parse_args()
     cases = json.loads(args.cases.read_text())
+    # Keep the terminal fixture version-agnostic while still checking that it
+    # ran the intended interpreter.
+    interpreter_version = f"Python {sys.version.split()[0]}"
+    for case in cases:
+        case["must_contain"] = [
+            value.replace("{{HERMES_PYTHON_VERSION}}", interpreter_version)
+            for value in case.get("must_contain", [])
+        ]
     if args.max_cases > 0:
         cases = cases[: args.max_cases]
     baseline_ids = {item.strip() for item in args.baseline_cases.split(",") if item.strip()}

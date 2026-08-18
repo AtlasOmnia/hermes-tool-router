@@ -11,7 +11,7 @@
     "prompt": "Use the terminal to run exactly this command without adding ./ or changing the path: `{{HERMES_PYTHON}} --version`. Return the exact output.",
     "expected_toolsets": ["terminal"],
     "expected_tools": ["terminal"],
-    "must_contain": ["Python 3.11.14"]
+    "must_contain": ["{{HERMES_PYTHON_VERSION}}"]
   },
   {
     "id": "file",
