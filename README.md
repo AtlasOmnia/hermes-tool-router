@@ -161,6 +161,10 @@ A stable release must demonstrate:
 
 No quantitative production claim should be made until a versioned live validation report satisfies those gates.
 
+## First-run onboarding
+
+A first-run onboarding skill ships with this repo: [`skills/hermes-tool-router-onboarding/SKILL.md`](skills/hermes-tool-router-onboarding/SKILL.md). On a fresh profile's first interaction, the agent should load it to explain what the router does, offer the optional classifier API key exactly once, and walk through verification. No API key is required — the router is fully functional with deterministic rules and fail-open behavior out of the box; the classifier is strictly optional, opt-in, confidence-gated, and fail-open.
+
 ## License
 
 MIT.
