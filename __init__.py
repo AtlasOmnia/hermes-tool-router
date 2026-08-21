@@ -208,7 +208,7 @@ def _route_tool_surface(source: str, agent: Any = None, **kwargs: Any) -> Option
 
     # Production policy: classify only the initial tool surface. Later turns
     # reuse the session-sticky surface so tool schemas remain cache-stable.
-    if state.initial_route_applied and source == "pre_turn_context_build":
+    if state.initial_route_applied:
         if turn_id:
             _mark_turn_routed(agent, state, turn_id, "sticky_surface")
         return None

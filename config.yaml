@@ -1,9 +1,6 @@
 # Hermes Tool Router v2 configuration — disabled until explicitly enabled.
 global:
   enabled: false
-  routing_scope: first_turn
-  expansion_mode: monotonic
-  shrink_mid_session: false
   floor_toolsets: []
   deterministic_rules_enabled: true
   confidence_threshold: 0.90

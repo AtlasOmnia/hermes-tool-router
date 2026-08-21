@@ -29,11 +29,11 @@ tool-schema overhead. Key behaviors (all in this plugin, v0.2+):
   reductions in the README baselines are large, but they are estimator results, not billing
   receipts — treat them as indicative, never as a guarantee.
 - **Session-sticky surface:** later turns reuse the initial routed surface instead of
-  reclassifying and shrinking it every turn (`routing_scope: first_turn`,
-  `shrink_mid_session: false`).
+  reclassifying and shrinking it every turn. This fixed behavior keeps the surface stable
+  across the session.
 - **Monotonic expansion:** if a pruned registered tool is requested later, its owning toolset
-  is added permanently for the session and is never re-pruned (`expansion_mode: monotonic`,
-  plus the `tool_request` middleware and `request_toolset` fallback).
+  is added permanently for the session and is never re-pruned. This fixed behavior comes from
+  the `tool_request` middleware and `request_toolset` fallback.
 - **Fail open:** uncertainty, invalid classifier output, missing confidence, timeout, registry
   mismatch, or unsupported runtime keeps the full tool surface. Nothing is ever pruned
   unless the router is confident (`fail_open: true`, `confidence_threshold: 0.90`).
@@ -128,8 +128,9 @@ After enabling (or to confirm an existing install):
 
 - **Keyless works fine.** The classifier is not required; deterministic rules + fail-open are a
   complete, supported configuration. Do not imply the router needs a key.
-- **The classifier only classifies the first turn** (`routing_scope: first_turn`). It never
-  re-routes mid-session; mid-session behavior is session-sticky with monotonic expansion.
+- **The classifier only classifies the first turn.** It never re-routes mid-session; mid-session
+  behavior is session-sticky with monotonic expansion and is fixed plugin behavior, not a
+  configurable mode.
 - **Never attribute deterministic savings to the classifier.** The baseline savings come from
   deterministic rules + fail-open and exist with the classifier disabled (its default). The
   classifier is an accuracy aid for ambiguous requests, not the source of the savings.

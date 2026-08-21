@@ -11,6 +11,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from typing import ClassVar
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 # Tests install a fake Hermes tool registry, so they do not require a live Hermes checkout.
@@ -62,7 +63,7 @@ class _Entry:
 
 
 class _FakeRegistry:
-    TOOLSETS = {
+    TOOLSETS: ClassVar[dict[str, list[str]]] = {
         "web": ["web_search"],
         "browser": ["browser_open"],
         "file": ["read_file"],
@@ -254,7 +255,6 @@ def test_inert_period_probes_skip_classifier_without_capturing_symbols(monkeypat
 
     def record_classifier(user_message, *args, **kwargs):
         classified.append(user_message)
-        return None
 
     monkeypatch.setattr(plugin, "_predict_toolsets_via_llm", record_classifier)
     for prompt in (".", "...", "…", "   ", ". ."):
@@ -284,6 +284,108 @@ def test_late_pre_llm_compatibility_routes_before_request_without_explicit_agent
 
     invoke_from_turn_context_stack()
     assert _exposed_toolsets(agent) == {"web", "request_toolset"}
+
+
+def test_late_only_web_to_file_recovers_without_rerouting(monkeypatch=None):
+    agent = _FakeAgent()
+    turn_one = "late-turn-one"
+    turn_two = "late-turn-two"
+    routed_prompts = []
+    original_predict = plugin._predict_toolsets_by_rules
+
+    def spy_predict(user_message, available):
+        routed_prompts.append(user_message)
+        return original_predict(user_message, available)
+
+    restore_predict = lambda: None
+    if monkeypatch is not None:
+        monkeypatch.setattr(plugin, "_predict_toolsets_by_rules", spy_predict)
+    else:
+        plugin._predict_toolsets_by_rules = spy_predict  # type: ignore[attr-defined]
+
+        def restore_predict():
+            plugin._predict_toolsets_by_rules = original_predict  # type: ignore[attr-defined]
+
+    try:
+        agent._current_turn_id = turn_one
+        plugin.pre_turn_context_build(
+            agent=agent,
+            session_id=agent.session_id,
+            task_id=agent._current_task_id,
+            turn_id=turn_one,
+            user_message="latest weather today",
+            conversation_history=[],
+            is_first_turn=True,
+            model=agent.model,
+            provider=agent.provider,
+            platform=agent.platform,
+            sender_id=agent._user_id,
+            available_toolsets=list(agent.enabled_toolsets),
+            available_tool_names=list(agent.valid_tool_names),
+        )
+
+        state = plugin._get_router_state(agent)
+        first_tool_names = {definition["function"]["name"] for definition in agent.tools}
+        assert routed_prompts == ["latest weather today"]
+        assert "web_search" in first_tool_names
+        assert "read_file" not in first_tool_names
+        assert state.active_toolsets == {"web"}
+
+        agent._current_turn_id = turn_two
+        plugin.pre_llm_call(
+            session_id=agent.session_id,
+            task_id=agent._current_task_id,
+            turn_id=turn_two,
+            user_message="read this file",
+            conversation_history=[{"role": "user", "content": "latest weather today"}],
+            is_first_turn=False,
+            model=agent.model,
+            provider=agent.provider,
+            platform=agent.platform,
+            sender_id=agent._user_id,
+        )
+
+        assert routed_prompts == ["latest weather today"]
+        assert state.active_toolsets == {"web"}
+        assert {definition["function"]["name"] for definition in agent.tools} == first_tool_names
+        assert "read_file" not in agent.valid_tool_names
+
+        recovery = plugin.tool_request_middleware(
+            session_id=agent.session_id,
+            tool_name="read_file",
+            args={},
+        )
+        assert recovery == {"args": {}, "router_recovered": "file"}
+        assert "read_file" in agent.valid_tool_names
+        assert "web_search" in agent.valid_tool_names
+        assert state.active_toolsets == {"web", "file"}
+
+        recovered_tool_names = {definition["function"]["name"] for definition in agent.tools}
+        assert "read_file" in recovered_tool_names
+        assert "web_search" in recovered_tool_names
+
+        plugin.pre_llm_call(
+            session_id=agent.session_id,
+            task_id=agent._current_task_id,
+            turn_id="late-turn-three",
+            user_message="read this file",
+            conversation_history=[
+                {"role": "user", "content": "latest weather today"},
+                {"role": "assistant", "content": "..."},
+            ],
+            is_first_turn=False,
+            model=agent.model,
+            provider=agent.provider,
+            platform=agent.platform,
+            sender_id=agent._user_id,
+        )
+
+        assert routed_prompts == ["latest weather today"]
+        assert state.active_toolsets == {"web", "file"}
+        assert {definition["function"]["name"] for definition in agent.tools} == recovered_tool_names
+    finally:
+        if monkeypatch is None:
+            restore_predict()
 
 
 def test_pre_llm_call_skips_after_core_hook_routed_turn():
@@ -375,6 +477,8 @@ if __name__ == "__main__":
     print("token-router hook surface smoke: ok")
     test_deterministic_routes()
     print("deterministic route smoke: ok")
+    test_late_only_web_to_file_recovers_without_rerouting()
+    print("late-only recovery smoke: ok")
     test_pre_llm_call_skips_after_core_hook_routed_turn()
     print("pre_llm_call skip smoke: ok")
     test_request_toolset_git_expansion()
