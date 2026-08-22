@@ -297,7 +297,10 @@ def test_late_only_web_to_file_recovers_without_rerouting(monkeypatch=None):
         routed_prompts.append(user_message)
         return original_predict(user_message, available)
 
-    restore_predict = lambda: None
+    def _restore_predict() -> None:
+        return None
+
+    restore_predict = _restore_predict
     if monkeypatch is not None:
         monkeypatch.setattr(plugin, "_predict_toolsets_by_rules", spy_predict)
     else:

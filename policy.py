@@ -11,12 +11,14 @@ from typing import Any, Dict, List, Optional, Set
 
 try:
     from .config import PLUGIN_NAME
-    from .classifier import call_with_hard_timeout
+    from .classifier import _strip_fence, call_with_hard_timeout
     from .intent import INTENT_TOOLSETS, Intent, classify_intent
 except ImportError:  # pragma: no cover - direct loader fallback
     from config import PLUGIN_NAME
-    from classifier import call_with_hard_timeout
+    from classifier import _strip_fence, call_with_hard_timeout
     from intent import INTENT_TOOLSETS, Intent, classify_intent
+
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +142,7 @@ def _get_router_client(
                 timeout=8,
                 max_retries=0,
                 default_headers={
-                    "HTTP-Referer": "https://github.com/hermes-agent/hermes-token-router",
+                    "HTTP-Referer": "https://github.com/AtlasOmnia/hermes-tool-router",
                     "X-Title": "Hermes Tool Router",
                 },
             )
@@ -278,6 +280,87 @@ def _extract_confidence(result: Any) -> Optional[float]:
         return parsed
 
     return None
+
+
+def _strip_classifier_content(content: str) -> str:
+    """Strip markdown fences using the shared classifier helper."""
+    return _strip_fence(content)
+
+
+def parse_classifier_payload(
+    content: str,
+    available_toolsets: Set[str],
+    confidence_threshold: float,
+) -> Dict[str, Any]:
+    """Validate classifier JSON against the strict fail-open contract.
+
+    Single source of truth shared with ``classifier.parse_classifier_output``:
+    numeric-only confidence in [0,1], missing/malformed/nonfinite/out-of-range
+    and below-threshold values all map to a full-surface fallback. Returns a
+    plain dict with one of: {"action": "full"}, {"action": "no_tools"},
+    {"action": "narrow", "toolsets": [...]}.
+    """
+    try:
+        result = json.loads(content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"action": "full"}
+    if not isinstance(result, dict):
+        return {"action": "full"}
+
+    raw_confidence = result.get("confidence")
+    if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, (int, float)):
+        # Tolerate the documented string/percent shapes via _extract_confidence.
+        raw_confidence = _extract_confidence(result)
+        if raw_confidence is None:
+            logger.info("%s: router omitted confidence; keeping full toolset", PLUGIN_NAME)
+            return {"action": "full"}
+    else:
+        raw_confidence = float(raw_confidence)
+        if not math.isfinite(raw_confidence) or not 0.0 <= raw_confidence <= 1.0:
+            # Out-of-range numerics get one tolerant rescale (e.g. 95 -> 0.95).
+            rescaled = _extract_confidence(result)
+            if rescaled is None:
+                return {"action": "full"}
+            raw_confidence = rescaled
+
+    if not math.isfinite(raw_confidence):
+        return {"action": "full"}
+
+    if raw_confidence < confidence_threshold:
+        logger.info(
+            "%s: router confidence %.3f below threshold %.3f; keeping full toolset",
+            PLUGIN_NAME,
+            raw_confidence,
+            confidence_threshold,
+        )
+        return {"action": "full"}
+
+    predicted_list = result.get("toolsets")
+    if not isinstance(predicted_list, list):
+        logger.debug(
+            "%s: router returned non-list: %s",
+            PLUGIN_NAME, result,
+        )
+        return {"action": "full"}
+
+    # Handle "all" bypass signal
+    if "all" in predicted_list:
+        return {"action": "full"}
+
+    selected = set(predicted_list) & set(available_toolsets)
+    if not selected and predicted_list:
+        logger.debug(
+            "%s: router returned empty set after filtering — full set fallback",
+            PLUGIN_NAME,
+        )
+        return {"action": "full"}
+
+    if not selected:
+        return {"action": "no_tools"}
+
+    return {"action": "narrow", "toolsets": sorted(selected)}
+
+
 def _predict_toolsets_via_llm(
     user_message: str,
     available_toolsets: Set[str],
@@ -348,8 +431,8 @@ def _predict_toolsets_via_llm(
             return None
         elapsed = time.monotonic() - start
 
-        content = response.choices[0].message.content or ""
-        
+        content = _strip_classifier_content(response.choices[0].message.content or "")
+
         logger.debug(
             "%s: router model=%s responded in %.2fs: %.100s",
             PLUGIN_NAME,
@@ -358,49 +441,22 @@ def _predict_toolsets_via_llm(
             content.strip(),
         )
 
-        # Parse JSON response
-        content = content.strip()
-        # Remove markdown code fences if present
-        if content.startswith("```"):
-            content = content.split("\n", 1)[-1]
-            content = content.rsplit("```", 1)[0]
-        content = content.strip()
-
-        result = json.loads(content)
-        predicted_list = result.get("toolsets", [])
-
-        confidence = _extract_confidence(result)
-        if confidence is None:
-            logger.info("%s: router omitted confidence; keeping full toolset", PLUGIN_NAME)
-            return None
-        if confidence < confidence_threshold:
-            logger.info(
-                "%s: router confidence %.3f below threshold %.3f; keeping full toolset",
-                PLUGIN_NAME,
-                confidence,
-                confidence_threshold,
-            )
-            return None
-
-        if not isinstance(predicted_list, list):
-            logger.debug(
-                "%s: router returned non-list: %s",
-                PLUGIN_NAME, result,
-            )
-            return None
+        result = parse_classifier_payload(content, available_toolsets, confidence_threshold)
 
         # Handle "all" bypass signal
-        if "all" in predicted_list:
+        if result.get("action") == "full":
             logger.debug(
-                "%s: router signaled 'all' — full set fallback",
+                "%s: router signaled full-surface — full set fallback",
                 PLUGIN_NAME,
             )
             return None
 
-        # Filter to only known toolsets. An empty list is a valid no-tool prediction.
-        predicted = set(predicted_list) & available_toolsets
+        if result.get("action") == "no_tools":
+            return set()
 
-        if not predicted and predicted_list:
+        predicted = set(result.get("toolsets") or []) & available_toolsets
+
+        if not predicted:
             logger.debug(
                 "%s: router returned empty set after filtering — full set fallback",
                 PLUGIN_NAME,
