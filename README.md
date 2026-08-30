@@ -52,9 +52,9 @@ The classifier adds one short network request, so it is not a universal latency 
 - **First-turn routing:** deterministic intent classification narrows the live tool surface before the first provider request through stock Hermes hooks.
 - **Session-sticky surface:** later turns reuse the initial surface instead of reclassifying and shrinking it.
 - **Monotonic recovery:** requested toolsets are added permanently for the session.
-- **Fail open:** uncertainty, invalid classifier output, missing confidence, timeout, registry mismatch, or unsupported runtime keeps the full tool surface.
+- **Fail open:** uncertainty, invalid classifier output, missing confidence, timeout, registry mismatch, or unsupported runtime keeps the full tool surface. Protected definitions additionally remain bounded by the immutable host-admission envelope; invalid policy denies new additions rather than broadening.
 - **Optional classifier:** external model routing is disabled by default. Deterministic misses fall back immediately with no network call.
-- **Dynamic recovery:** `request_toolset` is generated from the live toolset registry and can request multiple toolsets.
+- **Dynamic recovery:** `request_toolset` is generated from the live toolset registry and can request multiple toolsets. The registry is used for ordinary compatibility and discoverability only; protected definitions are recovered exclusively from the exact per-agent/session envelope.
 
 ## Critical compatibility fact
 
@@ -163,6 +163,28 @@ No quantitative production claim should be made until a versioned live validatio
 ## First-run onboarding
 
 A first-run onboarding skill ships with this repo: [`skills/hermes-tool-router-onboarding/SKILL.md`](skills/hermes-tool-router-onboarding/SKILL.md). On a fresh profile's first interaction, the agent should load it to explain what the router does, offer the optional classifier API key exactly once, and walk through verification. No API key is required — the router is fully functional with deterministic rules and fail-open behavior out of the box; the classifier is strictly optional, opt-in, confidence-gated, and fail-open.
+
+## Rev 6 host-admission and recovery contract
+
+The standalone router preserves Hermes's final authorization role while enforcing a local no-broadening rule for protected definitions. A protected ceiling is the exact protected surface admitted by the host for one agent/session. A pinned floor is the exact admitted subset that must remain visible. Every pin is protected, but direct-orchestrator protected tools remain optional unless explicitly pinned. Protected definitions retain their complete captured OpenAI schemas and original envelope order; they are never manufactured from the global registry.
+
+Trusted admission metadata is accepted only from the `hermes_token_router_admission` hook keyword and `_hermes_token_router_admission` agent attribute. Its exact version-1 shape is:
+
+```json
+{
+  "schema_version": 1,
+  "protected_toolsets": ["..."],
+  "pinned_tool_names": ["..."]
+}
+```
+
+`MISSING/MISSING` is a valid empty-policy compatibility case. Explicit `None`, booleans, malformed/unknown keys, empty or whitespace-padded identifiers, duplicates, and conflicting channels are invalid. Identifiers are not normalized. The adapter builds one immutable ordered owner snapshot from untouched input, evaluates worker identity once, composes the policy, and binds one result to the agent-attached `RouterState`. Same-session calls reuse that result by identity; disable/re-enable retains it and session end clears it. The process-global legacy state is never capability authority.
+
+A worker is recognized only when both `HERMES_KANBAN_TASK` is nonempty and Hermes reports a dispatcher-owned worker. Complete owner mapping pins every incoming definition owned by the worker toolset. Predicate, registry, or owner uncertainty is `SAFE_NO_PRUNE`. Direct orchestrators can use only their host-admitted protected subset. Specialists, delegated children, inherited non-dispatcher contexts, and cron do not gain worker authority from inherited environment. A valid explicit pin for a present owner-unmapped definition protects that exact name; absent siblings remain denied. No exact four-name policy is hard-coded.
+
+When untouched host provenance is unavailable, an attachable valid-policy call is `NO_AUTHORITY`: it preserves the current surface, denies protected additions, and permits append-only ordinary compatibility. The first ordinary append persists an immutable contamination marker before assignment; later same-session callers may append ordinary definitions but can never capture or promote an envelope. Invalid policy is transient `NO_AUTHORITY_INVALID_POLICY`: it preserves all fields, denies every new addition, performs no owner/definition lookup, creates no clean marker, and retains an existing marker. An unattachable agent is installed-only; capture-invalid input permits no expansion.
+
+Route, visible request, `tool_request` middleware, post-tool recovery, and fallback share deterministic admitted/denied/installed results. Mixed ordinary/protected requests may report ordinary additions plus explicit protected denial. Total protected denial is side-effect-free. Candidate validation precedes coordinated setters, and any partial-assignment failure restores the exact pre-call schemas, order, state fields, counters, fallback/retry markers, and lifecycle-slot identity. Retry is allowed only after exact admitted installation. The empty-message path binds admission before returning and performs no classifier, available-toolset, definition-retrieval, recovery-control, retry, or recapture work. Local synthetic tests are contract evidence only, not live runtime acceptance or production rollout.
 
 ## License
 

@@ -10,10 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 - OpenRouter classifier requests now attribute `HTTP-Referer` to this repository (`AtlasOmnia/hermes-tool-router`) instead of the upstream `hermes-agent` org.
 - Classifier response parsing is consolidated onto one strict fail-open contract (`parse_classifier_payload`), shared with `classifier.parse_classifier_output`. Documented string/percent confidence tolerance ("95%", `"0.93"`) is retained; non-finite values (NaN/inf) now provably fail open.
 - Replaced a lambda assignment in the smoke test (ruff E731); lint is clean.
+- Protected tool definitions now remain bounded by immutable per-agent/session host admission, with exact pinned floors, append-only ordinary compatibility, and transactional rollback across recovery paths.
+- Invalid or missing admission authority fails open without broadening protected capabilities; session contamination is recorded before ordinary compatibility appends.
 
 ### Added
 
 - Contract tests covering `parse_classifier_payload`: missing/malformed/nonfinite/below-threshold confidence, "all" signal, empty toolset lists, unknown toolsets, and invalid JSON all fail open.
+- Added focused Rev 6 contract coverage for host admission, protected-envelope recovery, lifecycle boundaries, truthful retry, and atomic rollback.
 
 ## [0.2.0rc1] - 2026-08-06
 

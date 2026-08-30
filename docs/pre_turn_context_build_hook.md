@@ -14,7 +14,7 @@ This hook would let plugins such as `hermes-token-router` adjust the active tool
 
 ## Motivation
 
-The test-profile token-router currently needs to reduce tool schema bloat before the main LLM request is built. Today it does that with a plugin-side runtime wrapper around `build_turn_context`. The wrapper is intentionally fail-open and guarded by `inspect.signature`, but it still depends on Hermes internals:
+The token-router currently needs to reduce tool schema bloat before the main LLM request is built. Today it does that with a plugin-side runtime wrapper around `build_turn_context`. The wrapper is intentionally fail-open and guarded by `inspect.signature`, but it still depends on Hermes internals:
 
 - positional argument order in `build_turn_context`;
 - `summarize_user_message_for_log` being passed as a keyword argument;
@@ -92,7 +92,7 @@ For the first implementation, `None` is enough. It matches current hook style an
 
 ## Current Wrapper vs. Clean Hook
 
-Current experimental test-profile shim:
+Current experimental token-router shim:
 
 ```text
 plugin register()
@@ -154,10 +154,10 @@ Hermes core does not need shared global state for this hook. The call is local t
 Hermes should treat hook exceptions like other plugin hook failures:
 
 - log the plugin error;
-- continue with the original full tool surface;
+- continue with the original full tool surface, subject to any already-bound valid admission envelope;
 - do not fail the user turn because an optimization hook failed.
 
-This preserves the token-router's fail-open safety model.
+For Rev 6, this fail-open behavior is bounded by the admission contract: a protected definition is never reconstructed from the registry, `SAFE_NO_PRUNE` restores the exact captured envelope, invalid/capture-invalid/no-authority statuses preserve the current surface and deny unsafe additions, and Hermes's normal authorization remains final.
 
 ## Non-Goals
 
@@ -170,4 +170,26 @@ That is a separate seam. A future hook such as `on_invalid_tool_call` or `on_pru
 1. Add `pre_turn_context_build` invocation to Hermes core before prompt/tool assembly. Done 2026-07-01.
 2. Update `hermes-token-router` to register the new hook. Done 2026-07-01.
 3. Remove the runtime wrapper from the plugin. Done 2026-07-01.
-4. Keep `pre_llm_call` registered as a backward-compatible late fallback for older Hermes builds or missed early-hook calls.
+4. Keep `pre_llm_call` registered as a backward-compatible late fallback for older Hermes versions or missed early-hook calls.
+
+## Rev 6 implementation contract
+
+The implemented hook is an admission-aware adapter, not a generic permission grant. Before inspecting whether `user_message` is empty, it resolves the live agent and nonempty session, reads any already-bound lifecycle result, and—only when it can prove untouched host input—captures the complete current definitions and enabled-toolset order once. The adapter parses trusted `hermes_token_router_admission` hook metadata and `_hermes_token_router_admission` agent metadata, builds one ordered owner snapshot, evaluates worker identity once, composes an immutable effective policy, and passes it to the agent-attached `RouterState`.
+
+The policy mapping is exactly:
+
+```json
+{
+  "schema_version": 1,
+  "protected_toolsets": ["..."],
+  "pinned_tool_names": ["..."]
+}
+```
+
+`MISSING/MISSING` is the valid empty-policy compatibility case. Explicit `None`, booleans, malformed mappings, invalid identifiers, duplicate identifiers, and conflicting channels are invalid. No identifiers are normalized. The generic `capabilities.py` core accepts one real `OwnerSnapshot` or typed `None`; no-envelope callers pass literal neutral worker values and do no environment, predicate, snapshot, owner, or definition work.
+
+A valid envelope freezes each complete OpenAI tool mapping in original order and records the owner observed at capture. The protected ceiling is the admitted protected surface; the pinned floor is the exact subset that must remain visible. A dispatcher-owned worker requires both a nonempty `HERMES_KANBAN_TASK` and a true Hermes dispatcher-owned predicate. Owner/predicate uncertainty is `SAFE_NO_PRUNE`. A direct orchestrator can route only its admitted protected subset and is not worker-pinned by default. Delegated, inherited non-dispatcher, and cron contexts do not gain worker authority from inherited environment. A present explicit owner-unmapped pin is protected by exact name; an absent sibling is never fetched.
+
+The same session-bound `EnsureAdmissionResult` object is reused by early route, late compatibility route, visible request, middleware, post-tool recovery, fallback, disable/re-enable, and session-end paths. The global recovery schema/catalog is discoverability only. Protected recovery is envelope-only; live registry recovery is limited to ordinary compatibility and ownership classification. Total protected denial is an atomic no-op. A clean attachable no-authority append persists a `NoAuthorityContamination` marker before assignment and permanently forbids same-session envelope capture; invalid policy preserves current state, denies every new addition, creates no clean marker, and retains an existing marker; an unattachable agent is installed-only; capture-invalid input permits no expansion.
+
+The empty-message path binds admission before returning and performs no classifier, available-toolset, definition-retrieval, recovery-control, retry, or recapture work. If a candidate setter fails after partial assignment, the plugin restores the exact pre-call surface, schemas, state, counters, fallback/retry values, routed-turn fields, and lifecycle-slot identity, and reports failure without fallback success. Local tests verify these contracts with synthetic fakes; they do not constitute live dispatcher, provider, credential, service, or production-rollout acceptance. `pre_llm_call` remains a late compatibility path and must not claim pre-preflight savings.

@@ -25,6 +25,15 @@ try:
         _is_router_active,
         _load_config,
     )
+    from .capabilities import (
+        MISSING,
+        EnsureAdmissionResult,
+        OwnerSnapshot,
+        TrustedHostPolicy,
+        compose_effective_policy,
+        read_trusted_host_policy,
+        result_for_status,
+    )
     from .policy import (
         ACTION_HINT_RE,
         PLAIN_ANSWER_RE,
@@ -58,7 +67,9 @@ try:
         _detect_missing_toolset,
         _ensure_recovery_tool,
         _expand_toolset,
+        expand_admitted_toolsets,
         _filter_tool_definitions,
+        _get_agent_local_tool_names,
         _get_all_tool_names,
         _get_recovery_tool_definition,
         _get_tool_definitions_for_names,
@@ -66,6 +77,8 @@ try:
         _infer_toolset_from_tool,
         _resolve_toolset_to_tool_names,
         _restore_full_tools,
+        restore_admitted_envelope,
+        select_and_commit_route,
     )
 except ImportError:  # pragma: no cover - direct loader fallback
     from config import (
@@ -80,6 +93,15 @@ except ImportError:  # pragma: no cover - direct loader fallback
         _is_classifier_enabled,
         _is_router_active,
         _load_config,
+    )
+    from capabilities import (
+        MISSING,
+        EnsureAdmissionResult,
+        OwnerSnapshot,
+        TrustedHostPolicy,
+        compose_effective_policy,
+        read_trusted_host_policy,
+        result_for_status,
     )
     from policy import (
         ACTION_HINT_RE,
@@ -114,7 +136,9 @@ except ImportError:  # pragma: no cover - direct loader fallback
         _detect_missing_toolset,
         _ensure_recovery_tool,
         _expand_toolset,
+        expand_admitted_toolsets,
         _filter_tool_definitions,
+        _get_agent_local_tool_names,
         _get_all_tool_names,
         _get_recovery_tool_definition,
         _get_tool_definitions_for_names,
@@ -122,6 +146,8 @@ except ImportError:  # pragma: no cover - direct loader fallback
         _infer_toolset_from_tool,
         _resolve_toolset_to_tool_names,
         _restore_full_tools,
+        restore_admitted_envelope,
+        select_and_commit_route,
     )
 
 logger = logging.getLogger(__name__)
@@ -389,7 +415,7 @@ def _route_tool_surface(source: str, agent: Any = None, **kwargs: Any) -> Option
     return complete()
 
 
-def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
+def _legacy_request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
     """Expand the live agent with one requested toolset."""
     requested_toolset = str(args.get("toolset") or args.get("toolset_name") or "").strip().lower()
     raw_toolsets = args.get("toolsets") or []
@@ -467,7 +493,7 @@ def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
     return json.dumps(response)
 
 
-def tool_request_middleware(**kwargs: Any) -> Optional[Dict[str, Any]]:
+def _legacy_tool_request_middleware(**kwargs: Any) -> Optional[Dict[str, Any]]:
     """Expand a registry-known pruned tool before Hermes validates/dispatches it.
 
     Hermes applies ``tool_request`` middleware before it passes the current
@@ -508,6 +534,13 @@ def tool_request_middleware(**kwargs: Any) -> Optional[Dict[str, Any]]:
 
 def on_session_end(**kwargs: Any) -> None:
     session_id = str(kwargs.get("session_id") or "")
+    agent = kwargs.get("agent")
+    if agent is None and session_id:
+        agent = _get_agent_ref(session_id)
+    if session_id and agent is not None:
+        state = _attached_capability_state(agent)
+        if state is not None:
+            state.end_admission(session_id)
     if session_id:
         _drop_agent_ref(session_id)
 
@@ -576,7 +609,7 @@ def pre_llm_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
     """Late fallback hook for older Hermes builds or missed early hooks."""
     return _route_tool_surface("pre_llm_call", **kwargs)
 
-def post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
+def _legacy_post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
     """Post-tool hook: detect missing tools and expand agent.tools dynamically.
 
     If a tool was called that isn't in our predicted set, we:
@@ -674,3 +707,667 @@ def post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
 _cfg = _load_config() if CONFIG_FILE.exists() else {}
 _prof_cfg = _get_profile_config(_cfg)
 logger.info("%s: plugin loaded profile=%s enabled=%s", PLUGIN_NAME, _prof_cfg.get("_profile_name"), _prof_cfg.get("enabled"))
+
+def _read_worker_task_id() -> str:
+    """Read the host worker signal at the adapter boundary only."""
+    import os
+
+    return os.environ.get("HERMES_KANBAN_TASK", "")
+
+
+def _is_dispatcher_owned_worker_context() -> bool:
+    """Ask Hermes once whether the current context owns a worker task."""
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+    except ImportError:
+        # Standalone plugin tests have no Hermes delegation module.  An absent
+        # optional adapter is a known non-worker context; a present callable
+        # that raises is handled as uncertainty by _ensure_host_admission.
+        return False
+    return bool(is_dispatcher_owned_worker_context())
+
+
+def _capture_owner_snapshot(agent: Any, untouched_surface: Any) -> OwnerSnapshot:
+    """Build one ordered owner snapshot without retrieving definitions."""
+    from collections.abc import Mapping
+
+    incoming_names: list[str] = []
+    malformed: list[int] = []
+    duplicates: list[str] = []
+    seen: set[str] = set()
+    for index, definition in enumerate(untouched_surface):
+        name: Any = None
+        if isinstance(definition, Mapping):
+            function = definition.get("function")
+            if isinstance(function, Mapping):
+                name = function.get("name")
+        if type(name) is not str or not name or name != name.strip():
+            malformed.append(index)
+            continue
+        incoming_names.append(name)
+        if name in seen:
+            duplicates.append(name)
+        seen.add(name)
+
+    if malformed or duplicates:
+        errors = [f"MALFORMED_DEFINITION_INDEX:{index}" for index in malformed]
+        errors.extend(f"DUPLICATE_DEFINITION_NAME:{name}" for name in duplicates)
+        return OwnerSnapshot(
+            incoming_names=tuple(incoming_names),
+            owner_by_name=(),
+            registry_import_ok=False,
+            registry_lookup_error_names=(),
+            agent_local_lookup_error_names=(),
+            malformed_definition_indexes=tuple(malformed),
+            duplicate_names=tuple(dict.fromkeys(duplicates)),
+            errors=tuple(dict.fromkeys(errors)),
+        )
+
+    owners: list[tuple[str, str | None]] = []
+    registry_lookup_errors: list[str] = []
+    local_lookup_errors: list[str] = []
+    try:
+        from tools.registry import registry
+    except Exception:
+        return OwnerSnapshot(
+            incoming_names=tuple(incoming_names),
+            owner_by_name=tuple((name, None) for name in incoming_names),
+            registry_import_ok=False,
+            registry_lookup_error_names=(),
+            agent_local_lookup_error_names=(),
+            malformed_definition_indexes=(),
+            duplicate_names=(),
+            errors=("REGISTRY_IMPORT_UNAVAILABLE",),
+        )
+
+    manager = getattr(agent, "_memory_manager", None)
+    has_local = getattr(manager, "has_tool", None)
+    for name in incoming_names:
+        owner: str | None = None
+        try:
+            entry = registry.get_entry(name)
+            candidate = getattr(entry, "toolset", None) if entry is not None else None
+            if type(candidate) is str and candidate:
+                owner = candidate
+        except Exception:
+            registry_lookup_errors.append(name)
+        if owner is None and callable(has_local):
+            try:
+                if has_local(name):
+                    owner = "memory"
+            except Exception:
+                local_lookup_errors.append(name)
+        owners.append((name, owner))
+
+    errors = []
+    if registry_lookup_errors:
+        errors.append("REGISTRY_OWNER_LOOKUP_UNAVAILABLE")
+    if local_lookup_errors:
+        errors.append("AGENT_LOCAL_OWNER_LOOKUP_UNAVAILABLE")
+    return OwnerSnapshot(
+        incoming_names=tuple(incoming_names),
+        owner_by_name=tuple(owners),
+        registry_import_ok=True,
+        registry_lookup_error_names=tuple(dict.fromkeys(registry_lookup_errors)),
+        agent_local_lookup_error_names=tuple(dict.fromkeys(local_lookup_errors)),
+        malformed_definition_indexes=(),
+        duplicate_names=(),
+        errors=tuple(errors),
+    )
+
+
+def _compose_effective_policy(
+    parsed_policy: TrustedHostPolicy,
+    owner_snapshot: OwnerSnapshot | None,
+    *,
+    adapter_protected_toolsets: frozenset[str],
+    worker_toolset: str,
+    has_nonempty_worker_task_id: bool,
+    dispatcher_owned_worker: bool | None,
+    worker_identity_error: str | None,
+) -> TrustedHostPolicy:
+    """Compose the sole typed host/no-envelope adapter seam."""
+    return compose_effective_policy(
+        parsed_policy,
+        owner_snapshot,
+        adapter_protected_toolsets=adapter_protected_toolsets,
+        worker_toolset=worker_toolset,
+        has_nonempty_worker_task_id=has_nonempty_worker_task_id,
+        dispatcher_owned_worker=dispatcher_owned_worker,
+        worker_identity_error=worker_identity_error,
+    )
+
+
+def _attached_capability_state(agent: Any) -> RouterState | None:
+    """Attach RouterState and verify identity; never substitute global state."""
+    if agent is None:
+        return None
+    try:
+        state = getattr(agent, ROUTER_STATE_ATTR, None)
+    except Exception:
+        state = None
+    if isinstance(state, RouterState):
+        return state
+    candidate = RouterState()
+    try:
+        setattr(agent, ROUTER_STATE_ATTR, candidate)
+        readback = getattr(agent, ROUTER_STATE_ATTR, None)
+    except Exception:
+        return None
+    return candidate if readback is candidate else None
+
+
+# Rev 6 admission adapter.  Every live caller uses this authoritative seam.
+
+
+def _ensure_host_admission(
+    *,
+    source: str,
+    agent: Any = None,
+    session_id: str = "",
+    untouched_surface: Any = MISSING,
+    original_enabled_toolsets: Any = MISSING,
+    hook_metadata: Any = MISSING,
+    agent_metadata: Any = MISSING,
+) -> EnsureAdmissionResult:
+    """Resolve one attached lifecycle and perform exactly one capture, if able."""
+    state = _attached_capability_state(agent)
+    if state is None:
+        return result_for_status(
+            "NO_AUTHORITY_UNATTACHABLE",
+            session_id,
+            diagnostics=("NO_PERSISTENT_CONTAMINATION_GUARD",),
+        )
+    prior = state.bound_host_admission(session_id)
+    if prior is not None:
+        return prior
+    marker = state.no_authority_contamination(session_id)
+    authoritative = (
+        untouched_surface is not MISSING
+        and original_enabled_toolsets is not MISSING
+        and marker is None
+    )
+    if authoritative:
+        parsed_policy = read_trusted_host_policy(hook_metadata, agent_metadata)
+        try:
+            owner_snapshot = _capture_owner_snapshot(agent, untouched_surface)
+        except Exception as exc:
+            owner_snapshot = OwnerSnapshot(
+                incoming_names=(),
+                owner_by_name=(),
+                registry_import_ok=False,
+                registry_lookup_error_names=(),
+                agent_local_lookup_error_names=(),
+                malformed_definition_indexes=(),
+                duplicate_names=(),
+                errors=(f"OWNER_SNAPSHOT_FAILED:{type(exc).__name__}",),
+            )
+        task_id = _read_worker_task_id()
+        has_task = type(task_id) is str and bool(task_id)
+        dispatcher_owned: bool | None = None
+        worker_error: str | None = None
+        if has_task:
+            try:
+                dispatcher_owned = _is_dispatcher_owned_worker_context()
+            except Exception:
+                worker_error = "WORKER_PREDICATE_UNAVAILABLE"
+        effective_policy = _compose_effective_policy(
+            parsed_policy,
+            owner_snapshot,
+            adapter_protected_toolsets=frozenset({"kanban"}),
+            worker_toolset="kanban",
+            has_nonempty_worker_task_id=has_task,
+            dispatcher_owned_worker=dispatcher_owned,
+            worker_identity_error=worker_error,
+        )
+        return state.ensure_host_admission(
+            session_id=session_id,
+            untouched_surface=untouched_surface,
+            original_enabled_toolsets=original_enabled_toolsets,
+            effective_policy=effective_policy,
+            owner_snapshot=owner_snapshot,
+        )
+
+    parsed_policy = read_trusted_host_policy(hook_metadata, agent_metadata)
+    effective_policy = _compose_effective_policy(
+        parsed_policy,
+        None,
+        adapter_protected_toolsets=frozenset({"kanban"}),
+        worker_toolset="kanban",
+        has_nonempty_worker_task_id=False,
+        dispatcher_owned_worker=None,
+        worker_identity_error=None,
+    )
+    return state.ensure_host_admission(
+        session_id=session_id,
+        untouched_surface=MISSING,
+        original_enabled_toolsets=MISSING,
+        effective_policy=effective_policy,
+        owner_snapshot=MISSING,
+    )
+
+
+def _route_tool_surface(
+    source: str,
+    agent: Any = None,
+    runtime_profile_name: Optional[str] = None,
+    **kwargs: Any,
+) -> Optional[Dict[str, Any]]:
+    """Capture admission before empty-message exits, then route one surface."""
+    cfg = _load_config()
+    if agent is None:
+        agent = _get_agent_from_stack() or _get_agent_ref(
+            str(kwargs.get("session_id") or "") or None
+        )
+    session_id = str(kwargs.get("session_id") or getattr(agent, "session_id", "") or "")
+    if agent is not None:
+        _store_agent_ref(agent, session_id)
+    if agent is None or not session_id:
+        return None
+
+    state = _get_router_state(agent)
+    marker = state.no_authority_contamination(session_id)
+    first_contact = not state.initial_route_applied and marker is None
+    hook_metadata = kwargs.get("hermes_token_router_admission", MISSING)
+    try:
+        agent_metadata = getattr(agent, "_hermes_token_router_admission", MISSING)
+    except Exception:
+        agent_metadata = MISSING
+    if first_contact:
+        untouched_surface = tuple(getattr(agent, "tools", ()) or ())
+        original_enabled = tuple(getattr(agent, "enabled_toolsets", ()) or ())
+    else:
+        untouched_surface = MISSING
+        original_enabled = MISSING
+    admission = _ensure_host_admission(
+        source=source,
+        agent=agent,
+        session_id=session_id,
+        untouched_surface=untouched_surface,
+        original_enabled_toolsets=original_enabled,
+        hook_metadata=hook_metadata,
+        agent_metadata=agent_metadata,
+    )
+
+    user_message = kwargs.get("user_message", "")
+    turn_id = kwargs.get("turn_id") or getattr(agent, "_current_turn_id", "") or ""
+    current_profile_cfg = _get_profile_config(cfg)
+    if not _is_router_active(cfg) or not current_profile_cfg.get("enabled", False):
+        if admission.status in {"READY", "SAFE_NO_PRUNE"} and admission.envelope is not None:
+            restore_admitted_envelope(agent, admission)
+        state.active = False
+        state.predicted_toolsets = None
+        if source == "pre_turn_context_build":
+            _mark_turn_routed(agent, state, turn_id, source)
+        return None
+    if not user_message:
+        # Admission is intentionally bound before this return.  Do not run
+        # classifier, available-toolset, retrieval, recovery, or retry work.
+        return None
+    if not _recovery_is_ready():
+        # The target runtime must retain its current surface until both
+        # recovery mechanisms are registered successfully.
+        state.active = False
+        state.predicted_toolsets = None
+        if source == "pre_turn_context_build":
+            _mark_turn_routed(agent, state, turn_id, source)
+        return None
+    if state.initial_route_applied:
+        turn_id = kwargs.get("turn_id") or getattr(agent, "_current_turn_id", "") or ""
+        if turn_id:
+            _mark_turn_routed(agent, state, turn_id, "sticky_surface")
+        return None
+    turn_id = kwargs.get("turn_id") or getattr(agent, "_current_turn_id", "") or ""
+    if source != "pre_turn_context_build" and _was_turn_routed(agent, state, turn_id):
+        return None
+
+    profile_cfg = _get_profile_config(cfg)
+    if not profile_cfg.get("enabled", False):
+        if admission.status in {"READY", "SAFE_NO_PRUNE"} and admission.envelope is not None:
+            restore_admitted_envelope(agent, admission)
+        state.active = False
+        state.predicted_toolsets = None
+        if source == "pre_turn_context_build":
+            _mark_turn_routed(agent, state, turn_id, source)
+        return None
+    if admission.status != "READY":
+        # SAFE_NO_PRUNE restores only its already captured envelope.  All
+        # other statuses preserve the current surface and deny additions.
+        if admission.status == "SAFE_NO_PRUNE" and admission.envelope is not None:
+            restore_admitted_envelope(agent, admission)
+        state.active = False
+        state.predicted_toolsets = None
+        if source == "pre_turn_context_build":
+            _mark_turn_routed(agent, state, turn_id, source)
+        return None
+
+    decline_chars = profile_cfg.get("long_message_decline_chars", 2000)
+    short_bypass_chars = profile_cfg.get("short_message_bypass_chars", 0)
+    floor_toolsets = set(profile_cfg.get("floor_toolsets", ["terminal", "file", "web"]))
+    try:
+        available = _get_available_toolsets()
+    except Exception:
+        available = set()
+    if not available:
+        restore_admitted_envelope(agent, admission)
+        if source == "pre_turn_context_build":
+            _mark_turn_routed(agent, state, turn_id, source)
+        return None
+    if len(user_message) > decline_chars:
+        restore_admitted_envelope(agent, admission)
+        if source == "pre_turn_context_build":
+            _mark_turn_routed(agent, state, turn_id, source)
+        return None
+    if short_bypass_chars > 0 and len(user_message.strip()) < short_bypass_chars:
+        restore_admitted_envelope(agent, admission)
+        if source == "pre_turn_context_build":
+            _mark_turn_routed(agent, state, turn_id, source)
+        return None
+    if not available:
+        restore_admitted_envelope(agent, admission)
+        if source == "pre_turn_context_build":
+            _mark_turn_routed(agent, state, turn_id, source)
+        return None
+
+    deterministic_enabled = bool(profile_cfg.get("deterministic_rules_enabled", True))
+    probe_chars = {char for char in user_message if not char.isspace()}
+    if not probe_chars or probe_chars <= {".", "…"}:
+        predicted: Optional[Set[str]] = set()
+    elif deterministic_enabled:
+        predicted, _ = _predict_toolsets_by_rules(user_message, available)
+    elif not _is_classifier_enabled(profile_cfg):
+        predicted = None
+    else:
+        try:
+            predicted = _predict_toolsets_via_llm(
+                user_message,
+                available,
+                _get_router_model(profile_cfg),
+                float(profile_cfg.get("confidence_threshold", 0.0)),
+                _get_router_provider(profile_cfg),
+                max(0.05, float(profile_cfg.get("router_hard_timeout_ms", 1200)) / 1000.0),
+                *_get_classifier_connection(profile_cfg),
+            )
+        except Exception:
+            predicted = None
+    if predicted is None:
+        restore_admitted_envelope(agent, admission)
+        if source == "pre_turn_context_build":
+            _mark_turn_routed(agent, state, turn_id, source)
+        return None
+
+    result = select_and_commit_route(
+        agent,
+        admission,
+        predicted_toolsets=set(predicted),
+        floor_toolsets=floor_toolsets,
+        available_toolsets=available,
+        caller="route",
+    )
+    state.last_expansion_result = result
+    if source == "pre_turn_context_build":
+        _mark_turn_routed(agent, state, turn_id, source)
+    return None
+
+
+def _call_admission_for_current(
+    source: str,
+    agent: Any,
+    session_id: str,
+    kwargs: dict[str, Any],
+) -> EnsureAdmissionResult:
+    try:
+        agent_metadata = getattr(agent, "_hermes_token_router_admission", MISSING)
+    except Exception:
+        agent_metadata = MISSING
+    return _ensure_host_admission(
+        source=source,
+        agent=agent,
+        session_id=session_id,
+        untouched_surface=MISSING,
+        original_enabled_toolsets=MISSING,
+        hook_metadata=kwargs.get("hermes_token_router_admission", MISSING),
+        agent_metadata=agent_metadata,
+    )
+
+
+def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
+    """Return a truthful result for one guarded expansion request."""
+    args = args if isinstance(args, dict) else {}
+    requested_toolset = str(args.get("toolset") or args.get("toolset_name") or "").strip().lower()
+    raw_toolsets = args.get("toolsets") or []
+    requested_toolsets = {
+        str(name).strip().lower()
+        for name in raw_toolsets
+        if isinstance(raw_toolsets, list) and str(name).strip()
+    }
+    if requested_toolset:
+        requested_toolsets.add(requested_toolset)
+    requested_tool = str(args.get("tool_name") or "").strip()
+    reason = str(args.get("reason") or "").strip()[:200]
+    session_id = str(kwargs.get("session_id") or "")
+    agent = _get_agent_ref(session_id) or kwargs.get("agent") or _get_agent_from_stack()
+    admission: EnsureAdmissionResult | None = None
+    if agent is not None:
+        session_id = session_id or str(getattr(agent, "session_id", "") or "")
+        if session_id:
+            _store_agent_ref(agent, session_id)
+        admission = _call_admission_for_current(
+            "visible_request", agent, session_id, kwargs
+        )
+    available: set[str] = set()
+    try:
+        from tools.registry import registry as validation_registry
+        available = set(validation_registry.get_registered_toolset_names())
+        if requested_tool and (
+            admission is None
+            or admission.status
+            not in {
+                "CAPTURE_INVALID_NO_MUTATION",
+                "SAFE_NO_PRUNE",
+                "SESSION_MISMATCH",
+                "NO_AUTHORITY_UNATTACHABLE",
+                "NO_AUTHORITY_INVALID_POLICY",
+            }
+        ):
+            owner = _infer_toolset_from_tool(requested_tool, validation_registry, None)
+            if owner:
+                requested_toolsets.add(owner)
+        requested_toolsets = {
+            validation_registry.get_toolset_alias_target(name) or name
+            for name in requested_toolsets
+        }
+    except Exception:
+        available = set()
+    local_memory_available = bool(_get_agent_local_tool_names(agent, "memory")) if agent is not None else False
+    if agent is not None and requested_tool:
+        bound = getattr(_get_router_state(agent), "_bound_admission_result", None)
+        envelope = getattr(bound, "envelope", None) if bound is not None else None
+        if envelope is not None:
+            captured = next((item for item in envelope.definitions if item.name == requested_tool), None)
+            if captured is not None:
+                if captured.owner_toolset_at_capture:
+                    requested_toolsets.add(captured.owner_toolset_at_capture)
+                elif (
+                    bound is not None
+                    and bound.effective_policy is not None
+                    and requested_tool in bound.effective_policy.pinned_tool_names
+                ):
+                    requested_toolsets.update(bound.effective_policy.protected_toolsets)
+    if not requested_toolsets and not (requested_tool and admission is not None):
+        return json.dumps({
+            "ok": False,
+            "error": "toolsets or resolvable tool_name is required",
+            "requested_toolsets": [],
+            "requested_tool": requested_tool,
+        })
+    unknown = requested_toolsets - available if available else set()
+    if local_memory_available:
+        unknown.discard("memory")
+    if unknown:
+        bad = sorted(unknown)[0]
+        suggestions = difflib.get_close_matches(bad, sorted(available), n=5)
+        return json.dumps({
+            "ok": False,
+            "error": f"unknown toolset: {bad}",
+            "requested_toolsets": sorted(requested_toolsets),
+            "requested_tool": requested_tool,
+            "suggestions": suggestions,
+            "available_toolsets": sorted(available),
+        })
+    if agent is None:
+        return json.dumps({
+            "ok": False,
+            "requested_toolsets": sorted(requested_toolsets),
+            "expanded_toolsets": [],
+            "denied_toolsets": sorted(requested_toolsets),
+            "denied_tool_names": [requested_tool] if requested_tool else [],
+            "added_tool_names": [],
+            "installed_tool_names": [],
+            "requested_tool": requested_tool,
+            "reason": "NO_PERSISTENT_CONTAMINATION_GUARD",
+            "retry_allowed": False,
+        })
+    try:
+        from tools.registry import registry as live_registry
+        requested_toolsets = {
+            str(live_registry.get_toolset_alias_target(name) or name)
+            for name in requested_toolsets
+        }
+    except Exception:
+        pass
+    if admission is None:
+        admission = _call_admission_for_current(
+            "visible_request", agent, session_id, kwargs
+        )
+    result = expand_admitted_toolsets(
+        agent,
+        admission,
+        requested_toolsets=requested_toolsets,
+        requested_tool_names={requested_tool} if requested_tool else set(),
+        caller="visible_request",
+        session_id=session_id,
+    )
+    if result.retry_allowed:
+        _get_router_state(agent)._retry_pending = False
+    payload = {
+        "ok": result.ok,
+        "toolsets": list(result.requested_toolsets),
+        "requested_toolsets": list(result.requested_toolsets),
+        "expanded_toolsets": list(result.expanded_toolsets),
+        "denied_toolsets": list(result.denied_toolsets),
+        "denied_tool_names": list(result.denied_tool_names),
+        "added_tool_names": list(result.added_tool_names),
+        "installed_tool_names": list(result.installed_tool_names),
+        "requested_tool": requested_tool,
+        "reason": reason or result.reason,
+        "retry_allowed": result.retry_allowed,
+        "enabled_tools": sorted(getattr(agent, "valid_tool_names", set()) or set()),
+    }
+    if len(result.requested_toolsets) == 1:
+        payload["toolset"] = result.requested_toolsets[0]
+    return json.dumps(payload, sort_keys=True)
+
+
+def tool_request_middleware(**kwargs: Any) -> Optional[Dict[str, Any]]:
+    """Admit a missing exact tool before normal Hermes dispatch validation."""
+    session_id = str(kwargs.get("session_id") or "")
+    agent = _get_agent_ref(session_id) or kwargs.get("agent") or _get_agent_from_stack()
+    tool_name = str(kwargs.get("tool_name") or "").strip()
+    args = kwargs.get("args")
+    if agent is None or not tool_name or not isinstance(args, dict):
+        return None
+    session_id = session_id or str(getattr(agent, "session_id", "") or "")
+    if tool_name in (getattr(agent, "valid_tool_names", set()) or set()):
+        return None
+    admission = _call_admission_for_current(
+        "middleware", agent, session_id, kwargs
+    )
+    expand_admitted_toolsets(
+        agent,
+        admission,
+        requested_toolsets=set(),
+        requested_tool_names={tool_name},
+        caller="middleware",
+        session_id=session_id,
+    )
+    if tool_name not in (getattr(agent, "valid_tool_names", set()) or set()):
+        return None
+    return {"args": dict(args), "router_recovered": _toolset_for_installed_name(tool_name, admission)}
+
+
+def _toolset_for_installed_name(name: str, admission: EnsureAdmissionResult) -> str:
+    if admission.envelope is not None:
+        for item in admission.envelope.definitions:
+            if item.name == name and item.owner_toolset_at_capture:
+                return item.owner_toolset_at_capture
+    registry = _registry_for_handler()
+    owner = _owner_for_name_handler(name, registry)
+    return owner or "unknown"
+
+
+def _registry_for_handler() -> Any:
+    try:
+        from tools.registry import registry
+        return registry
+    except Exception:
+        return None
+
+
+def _owner_for_name_handler(name: str, registry: Any) -> str | None:
+    if registry is None:
+        return None
+    try:
+        entry = registry.get_entry(name)
+        return getattr(entry, "toolset", None) if entry is not None else None
+    except Exception:
+        return None
+
+
+def post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
+    """Retry only after a guarded exact installation succeeded."""
+    session_id = str(kwargs.get("session_id") or "")
+    agent = _get_agent_ref(session_id) or kwargs.get("agent") or _get_agent_from_stack()
+    tool_name = str(kwargs.get("tool_name") or "").strip()
+    if agent is None or not tool_name:
+        return None
+    session_id = session_id or str(getattr(agent, "session_id", "") or "")
+    state = _get_router_state(agent)
+    if state._retry_pending or tool_name in (getattr(agent, "valid_tool_names", set()) or set()):
+        return None
+    admission = _call_admission_for_current(
+        "post_tool", agent, session_id, kwargs
+    )
+    result = expand_admitted_toolsets(
+        agent,
+        admission,
+        requested_toolsets=set(),
+        requested_tool_names={tool_name},
+        caller="post_tool",
+        session_id=session_id,
+    )
+    if tool_name in (getattr(agent, "valid_tool_names", set()) or set()) and result.retry_allowed:
+        state._retry_pending = True
+    return None
+
+
+def _handle_full_fallback(agent: Any) -> None:
+    """Fail closed: restore a valid envelope, otherwise preserve current state."""
+    state = _get_router_state(agent)
+    bound = getattr(state, "_bound_admission_result", None)
+    if isinstance(bound, EnsureAdmissionResult):
+        if bound.status in {"READY", "SAFE_NO_PRUNE"} and bound.envelope is not None:
+            if restore_admitted_envelope(agent, bound):
+                state.active = False
+                state.predicted_toolsets = None
+                state._fallback_triggered = True
+                state._retry_pending = False
+        return
+    # No authority, capture-invalid, contamination, and mismatch paths are
+    # preservation paths.  They must not use the mutable cache or claim retry.
+    if getattr(state, "_admission_session_id", None) is not None:
+        return
+    if state._full_tool_defs is not None:
+        agent.tools = list(state._full_tool_defs)
+        if hasattr(agent, "valid_tool_names"):
+            agent.valid_tool_names = set(state._full_tool_names)

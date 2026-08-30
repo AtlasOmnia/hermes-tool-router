@@ -5,6 +5,27 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Set
 
+try:
+    from .capabilities import (
+        MISSING,
+        EnsureAdmissionResult,
+        NoAuthorityContamination,
+        OwnerSnapshot,
+        TrustedHostPolicy,
+        build_host_admission_envelope,
+        result_for_status,
+    )
+except ImportError:  # pragma: no cover - direct loader fallback
+    from capabilities import (
+        MISSING,
+        EnsureAdmissionResult,
+        NoAuthorityContamination,
+        OwnerSnapshot,
+        TrustedHostPolicy,
+        build_host_admission_envelope,
+        result_for_status,
+    )
+
 logger = logging.getLogger(__name__)
 
 _agent_ref: Any = None
@@ -51,6 +72,154 @@ class RouterState:
         self.active_toolsets: Set[str] = set()
         self.registry_generation: int = 0
         self.expansion_count: int = 0
+        self.installed_tool_names: Set[str] = set()
+        self.admitted_toolsets: Set[str] = set()
+        self.denied_toolsets: Set[str] = set()
+        self.denied_tool_names: Set[str] = set()
+        self.last_expansion_result: Any = None
+        # Capability lifecycle is intentionally attached to this RouterState.
+        self._admission_session_id: Optional[str] = None
+        self._bound_admission_result: Optional[EnsureAdmissionResult] = None
+        self._contamination_marker: Optional[NoAuthorityContamination] = None
+
+    def bound_host_admission(self, session_id: str) -> Optional[EnsureAdmissionResult]:
+        """Return the one bound result, or a session-mismatch result."""
+        if self._admission_session_id is not None and self._admission_session_id != session_id:
+            return result_for_status("SESSION_MISMATCH", session_id)
+        return self._bound_admission_result
+
+    def no_authority_contamination(
+        self, session_id: str
+    ) -> Optional[NoAuthorityContamination]:
+        """Return the immutable first-append marker for this session."""
+        if self._admission_session_id != session_id:
+            return None
+        return self._contamination_marker
+
+    def mark_no_authority_contaminated(
+        self,
+        *,
+        session_id: str,
+        first_commit_caller: str,
+        first_added_tool_names: tuple[str, ...],
+        first_added_toolsets: tuple[str, ...],
+    ) -> NoAuthorityContamination:
+        """Persist and return the first ordinary-append marker before mutation."""
+        if self._admission_session_id not in (None, session_id):
+            raise RuntimeError("SESSION_MISMATCH")
+        if self._bound_admission_result is not None:
+            raise RuntimeError("ADMISSION_ALREADY_BOUND")
+        if self._contamination_marker is not None:
+            return self._contamination_marker
+        if first_commit_caller not in {"route", "visible_request", "middleware", "post_tool"}:
+            raise ValueError("INVALID_CONTAMINATION_CALLER")
+        if not first_added_tool_names or not first_added_toolsets:
+            raise ValueError("EMPTY_CONTAMINATION_MARKER")
+        marker = NoAuthorityContamination(
+            session_id=session_id,
+            first_commit_caller=first_commit_caller,  # type: ignore[arg-type]
+            first_added_tool_names=tuple(first_added_tool_names),
+            first_added_toolsets=tuple(first_added_toolsets),
+        )
+        self._admission_session_id = session_id
+        self._contamination_marker = marker
+        return marker
+
+    def ensure_host_admission(
+        self,
+        *,
+        session_id: str,
+        untouched_surface: Any = MISSING,
+        original_enabled_toolsets: Any = MISSING,
+        effective_policy: Optional[TrustedHostPolicy] = None,
+        owner_snapshot: Any = MISSING,
+    ) -> EnsureAdmissionResult:
+        """Bind one authoritative result or return transient no-authority state."""
+        if self._admission_session_id is not None and self._admission_session_id != session_id:
+            return result_for_status("SESSION_MISMATCH", session_id)
+        if self._bound_admission_result is not None:
+            return self._bound_admission_result
+        self._admission_session_id = session_id
+
+        contamination = self._contamination_marker
+        if effective_policy is None:
+            effective_policy = TrustedHostPolicy(frozenset(), frozenset(), (), False, ("MISSING_POLICY",))
+
+        no_envelope = (
+            untouched_surface is MISSING
+            or original_enabled_toolsets is MISSING
+            or owner_snapshot is MISSING
+        )
+        if no_envelope:
+            if not effective_policy.valid:
+                return result_for_status(
+                    "NO_AUTHORITY_INVALID_POLICY",
+                    session_id,
+                    effective_policy=effective_policy,
+                    contamination=contamination,
+                    diagnostics=effective_policy.errors,
+                )
+            if contamination is not None:
+                return result_for_status(
+                    "NO_AUTHORITY_CONTAMINATED",
+                    session_id,
+                    effective_policy=effective_policy,
+                    contamination=contamination,
+                    diagnostics=("ORDINARY_APPEND_BEFORE_HOST_CAPTURE",),
+                )
+            return result_for_status(
+                "NO_AUTHORITY",
+                session_id,
+                effective_policy=effective_policy,
+            )
+
+        if not isinstance(owner_snapshot, OwnerSnapshot):
+            result = result_for_status(
+                "CAPTURE_INVALID_NO_MUTATION",
+                session_id,
+                diagnostics=("MALFORMED_OWNER_SNAPSHOT",),
+            )
+            self._bound_admission_result = result
+            return result
+
+        envelope, diagnostics = build_host_admission_envelope(
+            session_id=session_id,
+            untouched_surface=untouched_surface,
+            original_enabled_toolsets=original_enabled_toolsets,
+            effective_policy=effective_policy,
+            owner_snapshot=owner_snapshot,
+        )
+        if envelope is None:
+            result = result_for_status(
+                "CAPTURE_INVALID_NO_MUTATION",
+                session_id,
+                diagnostics=tuple(diagnostics),
+            )
+            self._bound_admission_result = result
+            return result
+
+        status = "READY"
+        if not effective_policy.valid or effective_policy.preserve_input_surface:
+            status = "SAFE_NO_PRUNE"
+        result = result_for_status(
+            status,  # type: ignore[arg-type]
+            session_id,
+            envelope=envelope,
+            effective_policy=effective_policy,
+            owner_snapshot=owner_snapshot,
+            diagnostics=tuple(diagnostics) + effective_policy.errors,
+        )
+        self._bound_admission_result = result
+        return result
+
+    def end_admission(self, session_id: str) -> bool:
+        """Clear only the matching session's capability lifecycle slot."""
+        if self._admission_session_id != session_id:
+            return False
+        self._admission_session_id = None
+        self._bound_admission_result = None
+        self._contamination_marker = None
+        return True
 
     def set_initial_surface(self, toolsets: Set[str]) -> bool:
         """Set the routed surface once; later calls cannot shrink or replace it."""
@@ -87,6 +256,58 @@ class RouterState:
         self.active_toolsets = set()
         self.registry_generation = 0
         self.expansion_count = 0
+        self.installed_tool_names = set()
+        self.admitted_toolsets = set()
+        self.denied_toolsets = set()
+        self.denied_tool_names = set()
+        self.last_expansion_result = None
+
+    def capability_snapshot(self) -> dict[str, Any]:
+        """Return a shallow snapshot of coordinated router fields."""
+        return {
+            name: getattr(self, name)
+            for name in (
+                "active",
+                "predicted_toolsets",
+                "router_model",
+                "full_toolsets",
+                "config",
+                "_fallback_triggered",
+                "_full_tool_defs",
+                "_full_tool_names",
+                "_retry_pending",
+                "routed_turn_id",
+                "routed_source",
+                "initial_route_applied",
+                "initial_toolsets",
+                "active_toolsets",
+                "registry_generation",
+                "expansion_count",
+                "installed_tool_names",
+                "admitted_toolsets",
+                "denied_toolsets",
+                "denied_tool_names",
+                "last_expansion_result",
+            )
+        }
+
+    def restore_capability_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Restore a snapshot without recalculating or clearing admission slots."""
+        for name, value in snapshot.items():
+            setattr(self, name, value)
+
+    def admission_slots(self) -> tuple[object, object, object]:
+        """Expose lifecycle slots for transaction readback tests."""
+        return (
+            self._admission_session_id,
+            self._bound_admission_result,
+            self._contamination_marker,
+        )
+
+    def restore_admission_slots(self, slots: tuple[object, object, object]) -> None:
+        """Restore lifecycle slots exactly after a failed transaction."""
+        self._admission_session_id, self._bound_admission_result, self._contamination_marker = slots
+
 
 _router_state = RouterState()
 
@@ -101,7 +322,10 @@ def _get_router_state(agent: Any = None) -> RouterState:
             try:
                 setattr(agent, ROUTER_STATE_ATTR, state)
             except Exception:
-                return _router_state
+                # A non-attachable agent must never borrow process-global
+                # capability state.  The transient object is intentionally
+                # unusable as a persistent lifecycle guard.
+                return RouterState()
         return state
     if _agent_ref is not None:
         return _get_router_state(_agent_ref)
