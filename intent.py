@@ -49,6 +49,105 @@ _BROWSER_ACTION = re.compile(
     re.IGNORECASE,
 )
 _URL = re.compile(r"https?://", re.IGNORECASE)
+# Mechanical union of the existing English action literals used below.  The
+# residual Chinese conceptual rule must fail open when any of these signals is present.
+_ENGLISH_ACTION_SIGNAL = re.compile(
+    r"\b(?:"
+    r"computer[- _]?use|desktop control|control (?:the )?(?:desktop|computer)|"
+    r"capture (?:the )?(?:safari|chrome|browser|desktop|screen|window)|"
+    r"(?:safari|chrome) window|desktop window|"
+    r"screenshot|photo|picture|image|diagram|"
+    r"video|movie|clip|animation|"
+    r"log\s*in|sign\s*in|click|submit|fill|form|navigate|interact|checkout|purchase|"
+    r"search|research|look\s*up|latest|current|today|news|weather|price|online|"
+    r"read|inspect|review|"
+    r"save|write|edit|modify|patch|rename|copy|move|delete|"
+    r"run|execute|install|build|test|pytest|npm|compile|lint|shell|terminal|command|"
+    r"commit|push|pull|checkout|merge|git\s+diff|"
+    r"remember|store this|save this to memory|"
+    r"previous session|past conversation|session history|where did we leave|"
+    r"schedule|cron|remind me|every day|every week|"
+    r"delegate|subagent|sub-agent"
+    r")\b|https?://",
+    re.IGNORECASE,
+)
+_CONCEPTUAL_FRESHNESS_OR_URL = re.compile(
+    r"\b(current|latest|today|now|my|this\s+(?:file|repo|repository|image|screenshot))\b"
+    r"|最新|当前|今天|现在|我的|https?://",
+    re.IGNORECASE,
+)
+_CHINESE_LEADING_CONCEPTUAL = re.compile(
+    r"^\s*(?:请\s*(?:问\s*)?[，,:：]?\s*)?(?:什么是|为什么|为啥|怎么(?!样)|怎样|如何|比较|定义|谁是|"
+    r"讲讲|说说|请教|解释(?=一下|这个|该|原理|原因|[\s，。！？：?]|$))"
+)
+# Keep the …和别的方式有什么区别 family deferred: this sentence-final
+# conceptual rule runs before the Chinese action merge, and its guards cannot
+# distinguish 上网查一下这两个模型有什么区别 (must stay {web}) from
+# 运行测试和别的方式有什么区别. A Chinese imperative-lead exemption
+# mirroring _english_imperative_material_precedes_sentence_final would not
+# discriminate either, because both carry Chinese action verbs.
+_CHINESE_SENTENCE_FINAL_CONCEPTUAL = re.compile(
+    r"(?:是什么|什么意思|是干什么的|有什么用|是怎么回事)\s*[。！？!?]*$"
+)
+_ENGLISH_IMPERATIVE_LEAD = re.compile(
+    r"^\s*(?:"
+    r"control|capture|take|generate|create|draw|design|make|analy[sz]e|describe|animate|"
+    r"log\s*in|sign\s*in|click|submit|fill|navigate|interact|checkout|purchase|open|"
+    r"find|search|research|look\s*up|read|inspect|review|"
+    r"save|write|edit|modify|patch|rename|copy|move|delete|"
+    r"run|execute|install|build|test|compile|lint|"
+    r"commit|push|pull|merge|"
+    r"remember|store|schedule|remind|delegate|"
+    r"use|load"
+    r")\b",
+    re.IGNORECASE,
+)
+_CHINESE_EXPLICIT_REQUEST_LEAD = re.compile(r"^\s*(?:帮我|请|麻烦|给我|帮忙)")
+_CHINESE_FILESYSTEM_PATH = re.compile(
+    r"(?:^|[\s：:]|(?<=[\u4e00-\u9fff]))(?:/|\\)[A-Za-z0-9_./\\-]+"
+)
+_CHINESE_RESIDUAL_CONCEPTUAL = re.compile(
+    r"(?:什么是|是什么|为什么|有什么区别|区别|原理|"
+    r"解释(?=一下|这个|该|原理|原因|[\s，。！？：?]|$)|"
+    r"介绍(?=一下|这个|该|[\s，。！？：?]|$))"
+)
+_CHINESE_READ_ACTION = re.compile(
+    r"(?:帮我|请|麻烦)?(?:看看|看一下|查看|读取|读一下|打开|显示)"
+    r".{0,48}(?:文件|文档|目录|路径|内容|文本)"
+    r"|(?:帮我|请|麻烦)?(?:读取|查看|打开|显示)(?:/|\\)[A-Za-z0-9_./\\-]+",
+    re.IGNORECASE,
+)
+_CHINESE_WEB_SEARCH_ACTION = re.compile(
+    r"(?:上网|网上|在线)(?:查|搜索|搜|查询)(?:一下)?"
+    r"|(?:帮我|请|麻烦)?(?:查一下|查询一下|搜索一下|搜一下|查找一下)"
+    r".{0,80}(?:最新|当前|信息|资料|新闻|天气|跑分|基准|benchmark|网址|网页|网站|https?://)",
+    re.IGNORECASE,
+)
+_CHINESE_EXECUTE_ACTION = re.compile(
+    r"(?:把|将).{0,8}(?:目录|文件夹|项目).{0,32}"
+    r"(?:测试|pytest|test|命令|脚本).{0,12}(?:跑一遍|跑一下|运行|执行)"
+    r"|(?:请|帮我)?(?:运行|执行|跑一下|跑一遍)"
+    r".{0,80}(?:测试|pytest|test|命令|脚本|程序|项目|代码)"
+    r"|(?:把|将).{0,24}(?:测试|pytest|test|命令|脚本)"
+    r".{0,12}(?:跑一遍|跑一下|运行|执行)",
+    re.IGNORECASE,
+)
+_CHINESE_ACTION_RULES = (
+    (_CHINESE_READ_ACTION, Intent.READ_LOCAL),
+    (_CHINESE_WEB_SEARCH_ACTION, Intent.RESEARCH_WEB),
+    (_CHINESE_EXECUTE_ACTION, Intent.EXECUTE_LOCAL),
+)
+
+
+def _english_imperative_material_precedes_sentence_final(text: str) -> bool:
+    """Return whether an English action lead has a substantive clause before the suffix."""
+    lead_match = _ENGLISH_IMPERATIVE_LEAD.match(text)
+    question_match = _CHINESE_SENTENCE_FINAL_CONCEPTUAL.search(text)
+    if not lead_match or not question_match:
+        return False
+
+    between = text[lead_match.end() : question_match.start()]
+    return bool(re.search(r"[^\W_]", between, re.UNICODE))
 
 
 def classify_intent(message: str) -> IntentResult:
@@ -63,9 +162,16 @@ def classify_intent(message: str) -> IntentResult:
     if not text:
         return IntentResult(frozenset({Intent.FULL_SURFACE}), 0.0, "empty")
 
-    if _CONCEPTUAL.search(text) and not re.search(
-        r"\b(current|latest|today|now|my|this\s+(?:file|repo|repository|image|screenshot))\b|https?://",
-        lower,
+    if _CONCEPTUAL.search(text) and not _CONCEPTUAL_FRESHNESS_OR_URL.search(lower):
+        return IntentResult(frozenset({Intent.ANSWER_ONLY}), 0.99, "conceptual")
+    if _CHINESE_LEADING_CONCEPTUAL.search(text) and not _CONCEPTUAL_FRESHNESS_OR_URL.search(lower):
+        return IntentResult(frozenset({Intent.ANSWER_ONLY}), 0.99, "conceptual")
+    if (
+        _CHINESE_SENTENCE_FINAL_CONCEPTUAL.search(text)
+        and not _CONCEPTUAL_FRESHNESS_OR_URL.search(lower)
+        and not _CHINESE_EXPLICIT_REQUEST_LEAD.search(text)
+        and not _CHINESE_FILESYSTEM_PATH.search(text)
+        and not _english_imperative_material_precedes_sentence_final(text)
     ):
         return IntentResult(frozenset({Intent.ANSWER_ONLY}), 0.99, "conceptual")
 
@@ -83,28 +189,37 @@ def classify_intent(message: str) -> IntentResult:
     if explicit_intents:
         return IntentResult(frozenset(explicit_intents), 0.99, "explicit_tool_intent")
 
+    chinese_intents = {
+        intent for pattern, intent in _CHINESE_ACTION_RULES if pattern.search(text)
+    }
+
+    def _merge(found, confidence, reason):
+        if chinese_intents:
+            return IntentResult(frozenset(set(found) | chinese_intents), 0.95, "deterministic_actions_zh")
+        return IntentResult(frozenset(found), confidence, reason)
+
     if re.search(
         r"\b(computer[- _]?use|desktop control|control (?:the )?(?:desktop|computer)|"
         r"capture (?:the )?(?:safari|chrome|browser|desktop|screen|window)|"
         r"(?:safari|chrome) window|desktop window)\b",
         lower,
     ):
-        return IntentResult(frozenset({Intent.CONTROL_DESKTOP}), 0.99, "desktop_control")
+        return _merge({Intent.CONTROL_DESKTOP}, 0.99, "desktop_control")
 
     if re.search(r"\b(screenshot|photo|picture|image|diagram)\b", lower):
         if re.search(r"\b(generate|create|draw|design|make)\b", lower):
-            return IntentResult(frozenset({Intent.GENERATE_IMAGE}), 0.98, "generate_image")
+            return _merge({Intent.GENERATE_IMAGE}, 0.98, "generate_image")
         if re.search(r"\b(review|inspect|analy[sz]e|describe|read|look at)\b", lower):
-            return IntentResult(frozenset({Intent.ANALYZE_IMAGE}), 0.98, "analyze_image")
+            return _merge({Intent.ANALYZE_IMAGE}, 0.98, "analyze_image")
 
     if re.search(r"\b(video|movie|clip|animation)\b", lower):
         if re.search(r"\b(generate|create|make|animate)\b", lower):
-            return IntentResult(frozenset({Intent.GENERATE_VIDEO}), 0.96, "generate_video")
+            return _merge({Intent.GENERATE_VIDEO}, 0.96, "generate_video")
         if re.search(r"\b(analy[sz]e|review|describe|inspect)\b", lower):
-            return IntentResult(frozenset({Intent.ANALYZE_VIDEO}), 0.96, "analyze_video")
+            return _merge({Intent.ANALYZE_VIDEO}, 0.96, "analyze_video")
 
     if _URL.search(text) and _BROWSER_ACTION.search(text):
-        return IntentResult(frozenset({Intent.INTERACT_BROWSER}), 0.99, "interactive_url")
+        return _merge({Intent.INTERACT_BROWSER}, 0.99, "interactive_url")
 
     intents: set[Intent] = set()
     if _URL.search(text) or re.search(
@@ -132,8 +247,15 @@ def classify_intent(message: str) -> IntentResult:
     if re.search(r"\b(delegate|subagent|sub-agent)\b", lower):
         intents.add(Intent.DELEGATE)
 
-    if intents:
-        return IntentResult(frozenset(intents), 0.95, "deterministic_actions")
+    if intents or chinese_intents:
+        return _merge(intents, 0.95, "deterministic_actions")
+
+    if (
+        _CHINESE_RESIDUAL_CONCEPTUAL.search(text)
+        and not _CONCEPTUAL_FRESHNESS_OR_URL.search(lower)
+        and not _ENGLISH_ACTION_SIGNAL.search(lower)
+    ):
+        return IntentResult(frozenset({Intent.ANSWER_ONLY}), 0.99, "conceptual")
 
     if _CONCEPTUAL.search(text):
         return IntentResult(frozenset({Intent.ANSWER_ONLY}), 0.95, "conceptual")
