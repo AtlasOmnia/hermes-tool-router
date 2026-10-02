@@ -12,11 +12,11 @@ from typing import Any, Dict, List, Optional, Set
 try:
     from .config import PLUGIN_NAME
     from .classifier import _strip_fence, call_with_hard_timeout
-    from .intent import INTENT_TOOLSETS, Intent, classify_intent
+    from .intent import CHINESE_ABSTENTION_REASON, INTENT_TOOLSETS, Intent, classify_intent
 except ImportError:  # pragma: no cover - direct loader fallback
     from config import PLUGIN_NAME
     from classifier import _strip_fence, call_with_hard_timeout
-    from intent import INTENT_TOOLSETS, Intent, classify_intent
+    from intent import CHINESE_ABSTENTION_REASON, INTENT_TOOLSETS, Intent, classify_intent
 
 import math
 
@@ -218,6 +218,12 @@ def _predict_toolsets_by_rules(
         return None, "empty"
 
     intent_result = classify_intent(text)
+    if (
+        intent_result.intents == frozenset({Intent.FULL_SURFACE})
+        and intent_result.confidence == 0.0
+        and intent_result.reason_code == CHINESE_ABSTENTION_REASON
+    ):
+        return None, CHINESE_ABSTENTION_REASON
     if intent_result.intents == frozenset({Intent.ANSWER_ONLY}):
         return set(), f"intent:{intent_result.reason_code}"
     if Intent.FULL_SURFACE not in intent_result.intents:

@@ -13,6 +13,14 @@ sys.modules[PKG] = module
 spec.loader.exec_module(module)
 
 from hermes_tool_router_intent_test.intent import Intent, classify_intent
+from hermes_tool_router_intent_test import intent as _intent_module
+
+CHINESE_ABSTENTION_REASON = "zh_abstain_no_classifier"
+
+
+def chinese_abstention_reason(message: str) -> str | None:
+    helper = getattr(_intent_module, "chinese_abstention_reason", None)
+    return helper(message) if callable(helper) else None
 
 
 def test_conceptual_keyword_collisions_do_not_load_tools():
@@ -159,6 +167,16 @@ def test_chinese_ambiguous_and_keyword_collision_prompts_fail_open():
     for prompt in (
         "ping",
         "hi",
+    ):
+        result = classify_intent(prompt)
+        assert result.intents == frozenset({Intent.FULL_SURFACE}), prompt
+        assert result.confidence == 0.0, prompt
+        assert result.reason_code == "unresolved", prompt
+        predicted, reason = _predict_chinese_toolsets(prompt)
+        assert predicted == set(), (prompt, predicted, reason)
+        assert reason.startswith("plain_"), (prompt, predicted, reason)
+
+    for prompt in (
         "只回复两个字：成功",
         "检查hermes是否已升级",
         "评估 Hermes tool router这个插件",
@@ -167,10 +185,11 @@ def test_chinese_ambiguous_and_keyword_collision_prompts_fail_open():
     ):
         result = classify_intent(prompt)
         assert result.intents == frozenset({Intent.FULL_SURFACE}), prompt
-        assert result.reason_code == "unresolved", prompt
+        assert result.confidence == 0.0, prompt
+        assert result.reason_code == CHINESE_ABSTENTION_REASON, prompt
         predicted, reason = _predict_chinese_toolsets(prompt)
-        assert predicted == set(), (prompt, predicted, reason)
-        assert reason.startswith("plain_"), (prompt, predicted, reason)
+        assert predicted is None, (prompt, predicted, reason)
+        assert reason == CHINESE_ABSTENTION_REASON, (prompt, predicted, reason)
 
 
 def test_chinese_actions_containing_conceptual_nouns_match_english_controls():
@@ -430,8 +449,9 @@ def test_chinese_leading_freshness_guard_keeps_current_fail_open_behavior():
     assert control_predicted != predicted, (prompt, predicted, control_predicted)
     assert result.intents == frozenset({Intent.FULL_SURFACE}), result
     assert result.confidence == 0.0, result
-    assert result.reason_code == "unresolved", result
-    assert predicted == set(), (prompt, predicted, reason)
+    assert result.reason_code == CHINESE_ABSTENTION_REASON, result
+    assert predicted is None, (prompt, predicted, reason)
+    assert reason == CHINESE_ABSTENTION_REASON, (prompt, predicted, reason)
     assert control_reason == "intent:deterministic_actions", control
 
 
@@ -708,3 +728,98 @@ def test_sentence_final_chinese_concepts_do_not_hide_english_imperative_actions(
         assert result.reason_code == "conceptual", prompt
         assert predicted == set(), (prompt, predicted, reason)
         assert reason == "intent:conceptual", prompt
+
+
+def test_chinese_abstention_reason_corpus_is_exact_and_policy_marked():
+    from hermes_tool_router_intent_test.policy import _predict_toolsets_by_rules
+
+    marked = (
+        "只回复两个字：成功",
+        "检查hermes是否已升级",
+        "评估 Hermes tool router这个插件",
+        "Hermes内置了调用 codex的能力吗",
+        "帮我看看这个",
+        "什么是 glm-5.3 的最新跑分",
+        "不要运行测试",
+        "请不要运行pytest",
+        "别读取这个文件 /tmp/notes.txt",
+        "不要上网查一下最新信息",
+        "无需执行这个脚本",
+        "不必运行测试",
+        "“运行测试”",
+        '"读取这个文件"',
+        "'上网查一下最新信息'",
+        "`运行pytest`",
+        "“上网查一下https://example.com的最新信息”",
+        "这句话是：运行测试",
+        "他说：读取这个文件",
+        "日志显示：运行pytest",
+        "文档写着：上网查一下最新信息",
+        "这句话是: 运行测试",
+        "他说 : 读取这个文件",
+        "日志显示:运行pytest",
+        "文档写着 : 上网查一下最新信息",
+        "不要运行测试，请读取这个文件 /tmp/notes.txt",
+        "我知道了。不要运行测试",
+    )
+    for prompt in marked:
+        assert chinese_abstention_reason(prompt) == CHINESE_ABSTENTION_REASON, prompt
+        assert chinese_abstention_reason(f"  {prompt}  ") == CHINESE_ABSTENTION_REASON, prompt
+        result = classify_intent(prompt)
+        assert result.intents == frozenset({Intent.FULL_SURFACE}), prompt
+        assert result.confidence == 0.0, prompt
+        assert result.reason_code == CHINESE_ABSTENTION_REASON, prompt
+        predicted, reason = _predict_toolsets_by_rules(
+            prompt,
+            {"file", "web", "terminal"},
+        )
+        assert predicted is None, (prompt, predicted, reason)
+        assert reason == CHINESE_ABSTENTION_REASON, (prompt, predicted, reason)
+
+
+def test_chinese_abstention_marker_is_not_user_text_or_language_detector():
+    for prompt in (
+        CHINESE_ABSTENTION_REASON,
+        "請不要運行測試",
+        "テストを実行しないでください",
+        "테스트를 실행하지 마세요",
+    ):
+        assert chinese_abstention_reason(prompt) is None, prompt
+        assert classify_intent(prompt).reason_code != CHINESE_ABSTENTION_REASON, prompt
+
+
+def test_chinese_quoted_operands_and_positive_frames_remain_active():
+    from hermes_tool_router_intent_test.policy import _predict_toolsets_by_rules
+
+    positive = (
+        "帮我看看这个文件里写了什么 /root/config.yaml",
+        "请读取这个文件：/tmp/notes.txt",
+        "帮我读取/root/config.yaml",
+        "上网查一下 glm-5.3 的最新跑分",
+        "上网查一下https://example.com的最新信息？",
+        "把这个目录下的测试跑一遍",
+        "运行pytest：tests/test_intent.py",
+        "运行测试，然后看看两个版本的区别",
+        "介绍一下，跑一下测试",
+        "请读取这个文件：“/tmp/notes.txt”",
+    )
+    expected = (
+        (Intent.READ_LOCAL, {"file"}),
+        (Intent.READ_LOCAL, {"file"}),
+        (Intent.READ_LOCAL, {"file"}),
+        (Intent.RESEARCH_WEB, {"web"}),
+        (Intent.RESEARCH_WEB, {"web"}),
+        (Intent.EXECUTE_LOCAL, {"terminal"}),
+        (Intent.EXECUTE_LOCAL, {"terminal"}),
+        (Intent.EXECUTE_LOCAL, {"terminal"}),
+        (Intent.EXECUTE_LOCAL, {"terminal"}),
+        (Intent.READ_LOCAL, {"file"}),
+    )
+    for prompt, (expected_intent, expected_toolsets) in zip(positive, expected):
+        assert chinese_abstention_reason(prompt) is None, prompt
+        result = classify_intent(prompt)
+        assert result.intents == frozenset({expected_intent}), prompt
+        assert result.reason_code == "deterministic_actions_zh", prompt
+        predicted, reason = _predict_toolsets_by_rules(prompt, {"file", "web", "terminal"})
+        assert predicted == expected_toolsets, (prompt, predicted, reason)
+        assert reason == "intent:deterministic_actions_zh", prompt
