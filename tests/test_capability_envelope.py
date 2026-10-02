@@ -2673,3 +2673,568 @@ def test_incomplete_registration_preserves_admitted_surface_without_narrowing(
         assert state._bound_admission_result is admission
     finally:
         router.__dict__.update(flags)
+
+
+_POLICY_MODULE = sys.modules[router._predict_toolsets_via_llm.__module__]
+
+
+_MARKED_ZH_ABSTENTIONS = (
+    "只回复两个字：成功",
+    "检查hermes是否已升级",
+    "评估 Hermes tool router这个插件",
+    "Hermes内置了调用 codex的能力吗",
+    "帮我看看这个",
+    "什么是 glm-5.3 的最新跑分",
+    "不要运行测试",
+    "请不要运行pytest",
+    "别读取这个文件 /tmp/notes.txt",
+    "不要上网查一下最新信息",
+    "无需执行这个脚本",
+    "不必运行测试",
+    "“运行测试”",
+    '"读取这个文件"',
+    "'上网查一下最新信息'",
+    "`运行pytest`",
+    "“上网查一下https://example.com的最新信息”",
+    "这句话是：运行测试",
+    "他说：读取这个文件",
+    "日志显示：运行pytest",
+    "文档写着：上网查一下最新信息",
+    "这句话是: 运行测试",
+    "他说 : 读取这个文件",
+    "日志显示:运行pytest",
+    "文档写着 : 上网查一下最新信息",
+    "不要运行测试，请读取这个文件 /tmp/notes.txt",
+    "我知道了。不要运行测试",
+)
+
+
+def _install_classifier_spies(
+    patch: pytest.MonkeyPatch,
+    *,
+    toolsets: tuple[str, ...] = ("file",),
+) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+    """Spy on both the receiving alias and its policy client seam."""
+    policy_module = _POLICY_MODULE
+    alias_calls: list[tuple[Any, ...]] = []
+    client_calls: list[tuple[Any, ...]] = []
+    original_alias = router._predict_toolsets_via_llm
+    content = json.dumps({"toolsets": list(toolsets), "confidence": 1.0})
+
+    class _Completions:
+        def create(self, *args: Any, **kwargs: Any) -> Any:
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            )
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+
+    def client_spy(*args: Any, **kwargs: Any) -> tuple[Any, str]:
+        client_calls.append((args, kwargs))
+        return fake_client, "test-router-model"
+
+    def alias_spy(*args: Any, **kwargs: Any) -> Any:
+        alias_calls.append((args, kwargs))
+        return original_alias(*args, **kwargs)
+
+    patch.setattr(router, "_predict_toolsets_via_llm", alias_spy)
+    patch.setattr(policy_module, "_get_router_client", client_spy)
+    return alias_calls, client_calls
+
+
+def _agent_surface_snapshot(agent: Any) -> tuple[Any, set[str], list[str]]:
+    return list(agent.tools), set(agent.valid_tool_names), list(agent.enabled_toolsets)
+
+
+def test_marked_abstentions_restore_exact_envelope_across_configuration_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = {
+        "schema_version": 1,
+        "protected_toolsets": ["kanban"],
+        "pinned_tool_names": [],
+    }
+    for prompt in _MARKED_ZH_ABSTENTIONS:
+        for deterministic_enabled in (False, True):
+            for classifier_enabled in (False, True):
+                with monkeypatch.context() as patch:
+                    registry = _Rev6Registry()
+                    _rev6_registry_modules(patch, registry)
+                    _rev6_config(
+                        patch,
+                        registry,
+                        deterministic_rules_enabled=deterministic_enabled,
+                        classifier={"enabled": classifier_enabled},
+                        floor_toolsets=["terminal", "file", "web"],
+                    )
+                    agent = _rev6_agent(
+                        registry,
+                        f"marked-{abs(hash((prompt, deterministic_enabled, classifier_enabled)))}",
+                        names=(
+                            "web_search",
+                            "read_file",
+                            "run_command",
+                            "kanban_show",
+                            "kanban_complete",
+                            "request_toolset",
+                        ),
+                        enabled=("web", "file", "terminal", "kanban", "router_recovery"),
+                    )
+                    before = _agent_surface_snapshot(agent)
+                    alias_calls, client_calls = _install_classifier_spies(patch)
+                    router.pre_turn_context_build(
+                        agent=agent,
+                        session_id=agent.session_id,
+                        turn_id="marked-first-contact",
+                        user_message=prompt,
+                        hermes_token_router_admission=metadata,
+                    )
+                    assert _agent_surface_snapshot(agent) == before, (
+                        prompt,
+                        deterministic_enabled,
+                        classifier_enabled,
+                    )
+                    assert agent.tools == before[0]
+                    assert agent.valid_tool_names == before[1]
+                    assert agent.enabled_toolsets == before[2]
+                    state = router._get_router_state(agent)
+                    assert state._bound_admission_result is not None
+                    assert state._bound_admission_result.status == "READY"
+                    assert state._bound_admission_result.envelope is not None
+                    assert state.initial_route_applied is True
+                    assert alias_calls == [], prompt
+                    assert client_calls == [], prompt
+                    assert registry.definition_calls == [], prompt
+
+
+def test_marked_abstentions_restore_exact_envelope_on_late_first_contact_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = {
+        "schema_version": 1,
+        "protected_toolsets": ["kanban"],
+        "pinned_tool_names": [],
+    }
+    for prompt in _MARKED_ZH_ABSTENTIONS:
+        for deterministic_enabled in (False, True):
+            for classifier_enabled in (False, True):
+                with monkeypatch.context() as patch:
+                    registry = _Rev6Registry()
+                    _rev6_registry_modules(patch, registry)
+                    _rev6_config(
+                        patch,
+                        registry,
+                        deterministic_rules_enabled=deterministic_enabled,
+                        classifier={"enabled": classifier_enabled},
+                        floor_toolsets=["terminal", "file", "web"],
+                    )
+                    agent = _rev6_agent(
+                        registry,
+                        f"marked-late-{abs(hash((prompt, deterministic_enabled, classifier_enabled)))}",
+                        names=(
+                            "web_search",
+                            "read_file",
+                            "run_command",
+                            "kanban_show",
+                            "kanban_complete",
+                            "request_toolset",
+                        ),
+                        enabled=("web", "file", "terminal", "kanban", "router_recovery"),
+                    )
+                    before = _agent_surface_snapshot(agent)
+                    router._store_agent_ref(agent, agent.session_id)
+                    alias_calls, client_calls = _install_classifier_spies(patch)
+                    router.pre_llm_call(
+                        session_id=agent.session_id,
+                        turn_id="marked-late-first-contact",
+                        user_message=prompt,
+                        hermes_token_router_admission=metadata,
+                    )
+                    assert _agent_surface_snapshot(agent) == before, (
+                        prompt,
+                        deterministic_enabled,
+                        classifier_enabled,
+                    )
+                    assert agent.tools == before[0]
+                    assert agent.valid_tool_names == before[1]
+                    assert agent.enabled_toolsets == before[2]
+                    state = router._get_router_state(agent)
+                    assert state._bound_admission_result is not None
+                    assert state._bound_admission_result.status == "READY"
+                    assert state._bound_admission_result.envelope is not None
+                    assert state.initial_route_applied is True
+                    assert alias_calls == [], prompt
+                    assert client_calls == [], prompt
+                    assert registry.definition_calls == [], prompt
+
+
+def test_marked_abstention_late_only_first_contact_and_sticky_hooks_do_not_reclassify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(
+        monkeypatch,
+        registry,
+        deterministic_rules_enabled=False,
+        classifier={"enabled": True},
+        floor_toolsets=["terminal", "file", "web"],
+    )
+    metadata = {
+        "schema_version": 1,
+        "protected_toolsets": ["kanban"],
+        "pinned_tool_names": ["kanban_show"],
+    }
+    agent = _rev6_agent(
+        registry,
+        "marked-late-only",
+        names=("web_search", "read_file", "kanban_show", "request_toolset"),
+        enabled=("web", "file", "kanban", "router_recovery"),
+    )
+    before = _agent_surface_snapshot(agent)
+    router._store_agent_ref(agent, agent.session_id)
+    alias_calls, client_calls = _install_classifier_spies(monkeypatch)
+
+    router.pre_llm_call(
+        session_id=agent.session_id,
+        turn_id="late-first-contact",
+        user_message="不要运行测试",
+        hermes_token_router_admission=metadata,
+    )
+    assert _agent_surface_snapshot(agent) == before
+    assert router._get_router_state(agent)._bound_admission_result is not None
+    assert alias_calls == []
+    assert client_calls == []
+
+    router.pre_llm_call(
+        session_id=agent.session_id,
+        turn_id="late-first-contact",
+        user_message="不要运行测试",
+        hermes_token_router_admission={"schema_version": 1},
+    )
+    router.pre_llm_call(
+        session_id=agent.session_id,
+        turn_id="later-turn",
+        user_message="不要运行测试",
+        hermes_token_router_admission=None,
+    )
+    assert _agent_surface_snapshot(agent) == before
+    assert alias_calls == []
+    assert client_calls == []
+
+
+def test_marked_abstention_restores_terminal_omitting_pinned_and_empty_envelopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases = (
+        (
+            "terminal-omitting",
+            ("web_search", "kanban_show", "request_toolset"),
+            ("web", "kanban", "router_recovery"),
+            {"protected_toolsets": ["kanban"], "pinned_tool_names": []},
+        ),
+        (
+            "protected-pin",
+            ("web_search", "kanban_show", "request_toolset"),
+            ("web", "kanban", "router_recovery"),
+            {"protected_toolsets": ["kanban"], "pinned_tool_names": ["kanban_show"]},
+        ),
+        (
+            "empty-envelope",
+            (),
+            (),
+            {"protected_toolsets": ["kanban"], "pinned_tool_names": []},
+        ),
+    )
+    for label, names, enabled, policy_bits in cases:
+        with monkeypatch.context() as patch:
+            registry = _Rev6Registry()
+            _rev6_registry_modules(patch, registry)
+            _rev6_config(
+                patch,
+                registry,
+                deterministic_rules_enabled=False,
+                classifier={"enabled": True},
+                floor_toolsets=["terminal", "file", "web"],
+            )
+            agent = _rev6_agent(
+                registry,
+                f"envelope-{label}",
+                names=names or ("request_toolset",),
+                enabled=enabled or ("router_recovery",),
+            )
+            if not names:
+                agent.tools = []
+                agent.valid_tool_names = set()
+                agent.enabled_toolsets = []
+            before = _agent_surface_snapshot(agent)
+            metadata = {"schema_version": 1, **policy_bits}
+            alias_calls, client_calls = _install_classifier_spies(patch)
+            registry.definition_calls.clear()
+            router.pre_turn_context_build(
+                agent=agent,
+                session_id=agent.session_id,
+                turn_id=f"{label}-turn",
+                user_message="不要运行测试",
+                hermes_token_router_admission=metadata,
+            )
+            assert _agent_surface_snapshot(agent) == before, label
+            assert agent.tools == before[0], label
+            assert agent.valid_tool_names == before[1], label
+            assert agent.enabled_toolsets == before[2], label
+            assert alias_calls == [], label
+            assert client_calls == [], label
+            assert registry.definition_calls == [], label
+
+
+def test_positive_chinese_routing_is_deterministic_and_keeps_protected_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = {
+        "schema_version": 1,
+        "protected_toolsets": ["kanban"],
+        "pinned_tool_names": ["kanban_show"],
+    }
+    for classifier_enabled in (False, True):
+        with monkeypatch.context() as patch:
+            registry = _Rev6Registry()
+            _rev6_registry_modules(patch, registry)
+            _rev6_config(
+                patch,
+                registry,
+                deterministic_rules_enabled=True,
+                classifier={"enabled": classifier_enabled},
+                floor_toolsets=[],
+            )
+            agent = _rev6_agent(
+                registry,
+                f"positive-zh-{classifier_enabled}",
+                names=(
+                    "web_search",
+                    "read_file",
+                    "run_command",
+                    "kanban_show",
+                    "kanban_complete",
+                    "request_toolset",
+                ),
+                enabled=("web", "file", "terminal", "kanban", "router_recovery"),
+            )
+            alias_calls, client_calls = _install_classifier_spies(patch)
+            router.pre_turn_context_build(
+                agent=agent,
+                session_id=agent.session_id,
+                turn_id="positive-zh-turn",
+                user_message="请读取这个文件：/tmp/notes.txt",
+                hermes_token_router_admission=metadata,
+            )
+            expected_names = [
+                "read_file",
+                "kanban_show",
+                "request_toolset",
+            ]
+            assert [item["function"]["name"] for item in agent.tools] == expected_names
+            assert agent.valid_tool_names == set(expected_names)
+            assert agent.enabled_toolsets == ["file", "kanban", "router_recovery"]
+            assert [registry.definitions[name] for name in expected_names] == agent.tools
+            assert alias_calls == []
+            assert client_calls == []
+
+
+def test_protected_missing_positive_tool_denies_without_fabrication_or_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry, floor_toolsets=[])
+    agent = _rev6_agent(
+        registry,
+        "protected-missing-positive",
+        names=("web_search", "kanban_show", "request_toolset"),
+        enabled=("web", "kanban", "router_recovery"),
+    )
+    before = _agent_surface_snapshot(agent)
+    metadata = {
+        "schema_version": 1,
+        "protected_toolsets": ["terminal"],
+        "pinned_tool_names": [],
+    }
+    router.pre_turn_context_build(
+        agent=agent,
+        session_id=agent.session_id,
+        turn_id="protected-missing-turn",
+        user_message="运行测试",
+        hermes_token_router_admission=metadata,
+    )
+    assert _agent_surface_snapshot(agent) == before
+    assert "run_command" not in agent.valid_tool_names
+    assert router._get_router_state(agent).last_expansion_result.denied_toolsets == ("terminal",)
+    assert registry.definition_calls == []
+
+
+def test_classifier_first_positive_and_both_disabled_preserve_configuration_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(
+        monkeypatch,
+        registry,
+        deterministic_rules_enabled=False,
+        classifier={"enabled": True},
+        floor_toolsets=[],
+    )
+    agent = _rev6_agent(
+        registry,
+        "classifier-first-positive",
+        names=("web_search", "read_file", "run_command", "request_toolset"),
+        enabled=("web", "file", "terminal", "router_recovery"),
+    )
+    alias_calls, client_calls = _install_classifier_spies(monkeypatch, toolsets=("file",))
+    router.pre_turn_context_build(
+        agent=agent,
+        session_id=agent.session_id,
+        turn_id="classifier-first-positive-turn",
+        user_message="请读取这个文件：/tmp/notes.txt",
+    )
+    assert alias_calls and len(alias_calls) == 1
+    assert client_calls and len(client_calls) == 1
+    assert [item["function"]["name"] for item in agent.tools] == ["read_file", "request_toolset"]
+    assert agent.enabled_toolsets == ["file", "router_recovery"]
+
+    with monkeypatch.context() as patch:
+        registry2 = _Rev6Registry()
+        _rev6_registry_modules(patch, registry2)
+        _rev6_config(
+            patch,
+            registry2,
+            deterministic_rules_enabled=False,
+            classifier={"enabled": False},
+            floor_toolsets=[],
+        )
+        preserved = _rev6_agent(
+            registry2,
+            "both-disabled-generic",
+            names=("web_search", "read_file", "run_command", "request_toolset"),
+            enabled=("web", "file", "terminal", "router_recovery"),
+        )
+        before = _agent_surface_snapshot(preserved)
+        alias_calls2, client_calls2 = _install_classifier_spies(patch)
+        router.pre_turn_context_build(
+            agent=preserved,
+            session_id=preserved.session_id,
+            turn_id="both-disabled-turn",
+            user_message="an ambiguous request",
+        )
+        assert _agent_surface_snapshot(preserved) == before
+        assert alias_calls2 == []
+        assert client_calls2 == []
+
+
+def test_generic_unmarked_english_and_other_language_keep_classifier_branch_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for prompt in ("an ambiguous request", "これは曖昧な質問です"):
+        with monkeypatch.context() as patch:
+            registry = _Rev6Registry()
+            _rev6_registry_modules(patch, registry)
+            _rev6_config(
+                patch,
+                registry,
+                deterministic_rules_enabled=True,
+                classifier={"enabled": True},
+                floor_toolsets=[],
+            )
+            rules_agent = _rev6_agent(
+                registry,
+                f"generic-rules-{abs(hash(prompt))}",
+                names=("web_search", "read_file", "run_command", "request_toolset"),
+                enabled=("web", "file", "terminal", "router_recovery"),
+            )
+            rules_alias, rules_client = _install_classifier_spies(patch)
+            router.pre_turn_context_build(
+                agent=rules_agent,
+                session_id=rules_agent.session_id,
+                turn_id="generic-rules-turn",
+                user_message=prompt,
+            )
+            assert rules_alias == []
+            assert rules_client == []
+
+        with monkeypatch.context() as patch:
+            registry = _Rev6Registry()
+            _rev6_registry_modules(patch, registry)
+            _rev6_config(
+                patch,
+                registry,
+                deterministic_rules_enabled=False,
+                classifier={"enabled": True},
+                floor_toolsets=[],
+            )
+            classifier_agent = _rev6_agent(
+                registry,
+                f"generic-classifier-{abs(hash(prompt))}",
+                names=("web_search", "read_file", "run_command", "request_toolset"),
+                enabled=("web", "file", "terminal", "router_recovery"),
+            )
+            classifier_alias, classifier_client = _install_classifier_spies(patch)
+            router.pre_turn_context_build(
+                agent=classifier_agent,
+                session_id=classifier_agent.session_id,
+                turn_id="generic-classifier-turn",
+                user_message=prompt,
+            )
+            assert len(classifier_alias) == 1
+            assert len(classifier_client) == 1
+
+
+def test_recovery_after_positive_narrowing_uses_captured_schema_and_denies_registry_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry, floor_toolsets=[])
+    agent = _rev6_agent(
+        registry,
+        "positive-recovery",
+        names=("web_search", "read_file", "kanban_show", "request_toolset"),
+        enabled=("web", "file", "kanban", "router_recovery"),
+    )
+    metadata = {
+        "schema_version": 1,
+        "protected_toolsets": ["kanban"],
+        "pinned_tool_names": ["kanban_show"],
+    }
+    captured_schema = json.loads(json.dumps(registry.definitions["kanban_show"]))
+    router.pre_turn_context_build(
+        agent=agent,
+        session_id=agent.session_id,
+        turn_id="positive-recovery-turn",
+        user_message="请读取这个文件：/tmp/notes.txt",
+        hermes_token_router_admission=metadata,
+    )
+    assert [item["function"]["name"] for item in agent.tools] == [
+        "read_file",
+        "kanban_show",
+        "request_toolset",
+    ]
+    registry.definitions["kanban_show"]["description"] = "registry-mutated"
+    restored = json.loads(
+        router.request_toolset_handler(
+            {"tool_name": "kanban_show"},
+            agent=agent,
+            session_id=agent.session_id,
+        )
+    )
+    assert restored["ok"] is True
+    assert next(item for item in agent.tools if item["function"]["name"] == "kanban_show") == captured_schema
+
+    denied = json.loads(
+        router.request_toolset_handler(
+            {"tool_name": "kanban_sibling"},
+            agent=agent,
+            session_id=agent.session_id,
+        )
+    )
+    assert denied["ok"] is False
+    assert "kanban_sibling" in denied["denied_tool_names"]
+    assert "kanban_sibling" not in _rev6_names(agent)

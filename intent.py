@@ -139,6 +139,64 @@ _CHINESE_ACTION_RULES = (
 )
 
 
+CHINESE_ABSTENTION_REASON = "zh_abstain_no_classifier"
+_CHINESE_ABSTENTION_EXACT = frozenset(
+    {
+        "只回复两个字：成功",
+        "检查hermes是否已升级",
+        "评估 Hermes tool router这个插件",
+        "Hermes内置了调用 codex的能力吗",
+        "帮我看看这个",
+        "什么是 glm-5.3 的最新跑分",
+    }
+)
+_CHINESE_ABSTENTION_NEGATION_PREFIX = re.compile(
+    r"(?:^|[，,。！？!?；;]\s*)(?:请\s*)?(?:不要|别|无需|不必)\s*"
+)
+_CHINESE_ABSTENTION_REPORT_PREFIX = re.compile(
+    r"(?:^|[，,。！？!?；;]\s*)(?:这句话是|他说|日志显示|文档写着)\s*[:：]\s*"
+)
+_CHINESE_ABSTENTION_QUOTED_CONTENT = re.compile(
+    r"“(?P<curly>[^”]*)”|\"(?P<double>[^\"]*)\"|"
+    r"'(?P<single>[^']*)'|`(?P<backtick>[^`]*)`"
+)
+
+
+def _chinese_action_material(text: str) -> bool:
+    """Return whether text contains one of the bounded Chinese action forms."""
+    return any(pattern.search(text) for pattern, _intent in _CHINESE_ACTION_RULES)
+
+
+def _chinese_framed_action(
+    text: str,
+    frame: re.Pattern[str],
+) -> bool:
+    """Check action material in a negated/reported clause only."""
+    for match in frame.finditer(text):
+        remainder = text[match.end() :]
+        boundary = re.search(r"[。！？!?；;]", remainder)
+        clause = remainder if boundary is None else remainder[: boundary.start()]
+        if _chinese_action_material(clause):
+            return True
+    return False
+
+
+def chinese_abstention_reason(message: str) -> str | None:
+    """Return the internal no-classifier reason for bounded Chinese frames."""
+    text = (message or "").strip()
+    if text in _CHINESE_ABSTENTION_EXACT:
+        return CHINESE_ABSTENTION_REASON
+    if _chinese_framed_action(text, _CHINESE_ABSTENTION_NEGATION_PREFIX):
+        return CHINESE_ABSTENTION_REASON
+    if _chinese_framed_action(text, _CHINESE_ABSTENTION_REPORT_PREFIX):
+        return CHINESE_ABSTENTION_REASON
+    for match in _CHINESE_ABSTENTION_QUOTED_CONTENT.finditer(text):
+        content = next((value for value in match.groups() if value is not None), "")
+        if _chinese_action_material(content):
+            return CHINESE_ABSTENTION_REASON
+    return None
+
+
 def _english_imperative_material_precedes_sentence_final(text: str) -> bool:
     """Return whether an English action lead has a substantive clause before the suffix."""
     lead_match = _ENGLISH_IMPERATIVE_LEAD.match(text)
@@ -158,6 +216,13 @@ def classify_intent(message: str) -> IntentResult:
     """
 
     text = (message or "").strip()
+    abstention_reason = chinese_abstention_reason(text)
+    if abstention_reason is not None:
+        return IntentResult(
+            frozenset({Intent.FULL_SURFACE}),
+            0.0,
+            abstention_reason,
+        )
     lower = text.lower()
     if not text:
         return IntentResult(frozenset({Intent.FULL_SURFACE}), 0.0, "empty")
