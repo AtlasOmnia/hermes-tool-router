@@ -39,6 +39,7 @@ try:
         read_trusted_host_policy,
         result_for_status,
     )
+    from .intent import CHINESE_ABSTENTION_REASON, chinese_abstention_reason
     from .policy import (
         ACTION_HINT_RE,
         PLAIN_ANSWER_RE,
@@ -105,6 +106,7 @@ except ImportError:  # pragma: no cover - direct loader fallback
         read_trusted_host_policy,
         result_for_status,
     )
+    from intent import CHINESE_ABSTENTION_REASON, chinese_abstention_reason
     from policy import (
         ACTION_HINT_RE,
         PLAIN_ANSWER_RE,
@@ -897,6 +899,14 @@ def _route_fenced(
     if source != "pre_turn_context_build" and _was_turn_routed(agent, state, turn_id):
         return None
 
+    if chinese_abstention_reason(user_message) == CHINESE_ABSTENTION_REASON:
+        restore_admitted_envelope(agent, admission)
+        if source == "pre_turn_context_build":
+            _mark_turn_routed(agent, state, turn_id, source)
+        return None
+
+    # Enablement (config, environment, /router) was decided at the top of
+    # this route; settings apply whether or not config.yaml enables routing.
     profile_cfg = _routing_settings(cfg)
     if admission.status != "READY":
         # SAFE_NO_PRUNE restores only its already captured envelope.  All
