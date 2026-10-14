@@ -2937,3 +2937,62 @@ def test_worker_thread_lookup_never_binds_another_sessions_agent(monkeypatch: py
         user_message="search the web for news",
     )
     assert other.tools == before
+
+
+
+def test_tool_search_bridge_and_deferred_toolsets_survive_narrowing(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    # Hermes tool search: deferred tools (computer_use, cronjob, a protected
+    # deferred toolset) are absent from agent.tools and fronted by the bridge;
+    # their toolsets remain in enabled_toolsets.
+    agent = _rev6_agent(
+        registry,
+        "bridge-narrowing",
+        names=("web_search", "read_file", "run_command", "tool_search", "tool_describe", "tool_call"),
+        enabled=("web", "file", "terminal", "computer_use", "cronjob", "secret_deferred"),
+    )
+    metadata = {
+        "schema_version": 1,
+        "protected_toolsets": ["secret_deferred"],
+        "pinned_tool_names": [],
+    }
+    assert _rev6_admit(agent, monkeypatch, hook_metadata=metadata, owned=False).status == "READY"
+    _route(agent, "bridge-1", "search the web for news")
+    names = _rev6_names(agent)
+    assert names[:4] == ["web_search", "tool_search", "tool_describe", "tool_call"]
+    assert names[-1] == "request_toolset"
+    assert "read_file" not in names and "run_command" not in names
+    assert {"computer_use", "cronjob"} <= set(agent.enabled_toolsets)
+    assert "file" not in agent.enabled_toolsets
+    # A protected toolset is never re-enabled behind the bridge.
+    assert "secret_deferred" not in agent.enabled_toolsets
+    assert "tool_search" in _recovery_description(agent)
+
+    response = json.loads(
+        router.request_toolset_handler({"toolsets": ["file"]}, agent=agent, session_id=agent.session_id)
+    )
+    assert response["ok"] is True
+    assert {"tool_search", "tool_describe", "tool_call", "read_file"} <= set(_rev6_names(agent))
+    assert {"computer_use", "cronjob", "file"} <= set(agent.enabled_toolsets)
+    assert "secret_deferred" not in agent.enabled_toolsets
+
+
+def test_restore_returns_exact_enabled_toolsets_with_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    enabled = ("web", "file", "computer_use", "cronjob")
+    agent = _rev6_agent(
+        registry,
+        "bridge-restore",
+        names=("web_search", "read_file", "tool_search", "tool_describe", "tool_call"),
+        enabled=enabled,
+    )
+    original_tools = list(agent.tools)
+    admission = _rev6_admit(agent, monkeypatch, owned=False)
+    assert admission.status == "READY"
+    assert router.restore_admitted_envelope(agent, admission) is True
+    assert list(agent.tools) == original_tools
+    assert list(agent.enabled_toolsets) == list(enabled)

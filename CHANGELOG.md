@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Fixed
 
+- Current Hermes runs `pre_llm_call`/`post_tool_call` on a timeout worker thread, where the stack walk could not see the agent, so the router silently did nothing. Agent lookup now also searches other live threads for the agent with the exact hook `session_id` (never another session's agent).
+- Narrowing no longer breaks Hermes tool search: the `tool_search`/`tool_describe`/`tool_call` bridge is always kept, and toolsets reachable only through the bridge stay in `enabled_toolsets` (protected toolsets excepted), so deferred tools such as `computer_use`, `cronjob_manage`, `browser_vault`, MCP and plugin tools remain usable. Envelope restore now restores `enabled_toolsets` exactly when the bridge is present. The capability catalog points the model to `tool_search` for deferred tools.
+
 - The model can now say what it can do after first-turn narrowing: `request_toolset` carries a per-session capability catalog (admitted toolsets with one-line descriptions) instead of a generic one-line description, so capability questions no longer depend on the model first attempting a pruned tool. The `toolsets` parameter description is now generated from the registry, as documented.
 - Standalone capability questions ("what can you do?", "what tools do you have access to?") are classified as `capability_inquiry` and route to the small surface consistently; previously some wordings fell back to the full surface and others to answer-only. Messages that also carry a task keep their normal routing.
 - Partially admitted toolsets are listed with their admitted tool names rather than the toolset's generic description.

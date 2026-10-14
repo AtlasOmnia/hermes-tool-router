@@ -41,6 +41,39 @@ RECOVERY_TOOL_NAME = "request_toolset"
 RECOVERY_TOOLSET = "router_recovery"
 RECOVERY_TOOLSET_CHOICES = sorted(TOOLSET_DESCRIPTIONS)
 
+# Hermes "tool search" (progressive disclosure) replaces deferred tools in the
+# model-visible array with these three bridge tools at agent build time.  They
+# have no registry toolset, and the deferred tools behind them are scoped by
+# the agent's enabled_toolsets.  Narrowing must keep both, or every deferred
+# tool (computer_use, cronjob, browser_vault, MCP and plugin tools, ...) becomes
+# unreachable for the rest of the session.
+BRIDGE_TOOL_NAMES = frozenset({"tool_search", "tool_describe", "tool_call"})
+
+
+def _bridge_only_toolsets(envelope: Any, protected_toolsets: Any = ()) -> tuple[str, ...]:
+    """Enabled toolsets reachable only through the tool-search bridge.
+
+    These own no definition in the captured surface (their tools were deferred
+    behind the bridge), so keeping them enabled costs no schema tokens.
+    Protected toolsets are never retained this way: protected capability comes
+    only from captured definitions.
+    """
+    if envelope is None:
+        return ()
+    names = {item.name for item in envelope.definitions}
+    if not names & BRIDGE_TOOL_NAMES:
+        return ()
+    owners = {item.owner_toolset_at_capture for item in envelope.definitions}
+    protected = set(protected_toolsets or ())
+    return tuple(
+        toolset
+        for toolset in (envelope.original_enabled_toolsets or ())
+        if isinstance(toolset, str)
+        and toolset not in owners
+        and toolset != RECOVERY_TOOLSET
+        and toolset not in protected
+    )
+
 
 # Bounds for the per-session capability catalog carried in request_toolset's
 # description.  Keep it compact and deterministic so the tool prefix stays
@@ -68,6 +101,7 @@ def _catalog_toolset_names(toolsets: Iterable[Any]) -> list[str]:
 def build_capability_catalog_description(
     admitted: Mapping[str, Iterable[str]] | Iterable[str],
     registry_members: Mapping[str, Iterable[str]] | None = None,
+    bridge: bool = False,
 ) -> str:
     """Return the deterministic request_toolset description for one session.
 
@@ -117,6 +151,12 @@ def build_capability_catalog_description(
         "though an account, credential, or approval may still be required. "
         "Call this tool with the exact toolset names to load them before using them. "
         "Never say a listed capability is unavailable without first loading it."
+        + (
+            " More tools are available on demand through tool_search; they are not "
+            "listed here, so search there before saying a capability is unavailable."
+            if bridge
+            else ""
+        )
     )
 
 
@@ -124,6 +164,7 @@ def with_capability_catalog(
     recovery_definition: dict[str, Any],
     admitted: Mapping[str, Iterable[str]] | Iterable[str],
     registry_members: Mapping[str, Iterable[str]] | None = None,
+    bridge: bool = False,
 ) -> dict[str, Any]:
     """Return an agent-local copy of the recovery definition with the catalog.
 
@@ -132,7 +173,9 @@ def with_capability_catalog(
     definition = copy.deepcopy(recovery_definition)
     function = definition.get("function")
     if isinstance(function, dict):
-        function["description"] = build_capability_catalog_description(admitted, registry_members)
+        function["description"] = build_capability_catalog_description(
+            admitted, registry_members, bridge
+        )
         # Keep one list in the definition: the toolsets parameter names the
         # session catalog rather than the whole registry.
         toolsets_param = (
@@ -669,6 +712,10 @@ def _restore_agent_fields(agent: Any, snapshot: dict[str, tuple[bool, Any]]) -> 
                 pass
 
 
+def names_include_bridge(names: Any) -> bool:
+    return bool(set(names) & BRIDGE_TOOL_NAMES)
+
+
 def _commit_candidate(
     agent: Any,
     state: Any,
@@ -682,8 +729,13 @@ def _commit_candidate(
     denied_tool_names: tuple[str, ...],
     predicted_toolsets: set[str] | None = None,
     initial: bool = False,
+    retained_toolsets: tuple[str, ...] = (),
 ) -> None:
-    """Apply all coordinated fields, allowing the caller to roll back."""
+    """Apply all coordinated fields, allowing the caller to roll back.
+
+    ``retained_toolsets`` stay in ``enabled_toolsets`` without being part of
+    the admitted surface (bridge-only toolsets; see _bridge_only_toolsets).
+    """
     _validate_candidate_definitions(candidate)
     names = tuple(_tool_name(definition) for definition in candidate)
     represented = {
@@ -692,10 +744,12 @@ def _commit_candidate(
         if owner_by_name.get(name) and owner_by_name[name] != RECOVERY_TOOLSET
     }
     base = list(base_enabled_toolsets or ()) if isinstance(base_enabled_toolsets, (list, tuple, set)) else []
+    retained = set(retained_toolsets) if names_include_bridge(names) else set()
     enabled: list[str] = [
         toolset
         for toolset in base
         if toolset in represented
+        or toolset in retained
         or (toolset == RECOVERY_TOOLSET and RECOVERY_TOOL_NAME in names)
     ]
     enabled.extend(sorted(represented - set(enabled)))
@@ -829,6 +883,7 @@ def select_and_commit_route(
                     denied_tool_names=(),
                     predicted_toolsets=set(),
                     initial=True,
+                    retained_toolsets=tuple(envelope.original_enabled_toolsets or ()),
                 )
             except Exception as exc:
                 return _failure_result(
@@ -862,9 +917,11 @@ def select_and_commit_route(
     denied_names: set[str] = set()
     ordinary_candidates: list[tuple[str, dict[str, Any], str | None]] = []
 
-    # Pinned definitions are always selected from the immutable envelope.
+    # Pinned definitions and the tool-search bridge are always selected from
+    # the immutable envelope (the bridge fronts deferred tools; see
+    # BRIDGE_TOOL_NAMES).
     for item in envelope.definitions:
-        if item.name in pins:
+        if item.name in pins or item.name in BRIDGE_TOOL_NAMES:
             selected[item.name] = thaw_json(item.payload)
             selected_owner[item.name] = item.owner_toolset_at_capture
 
@@ -912,6 +969,7 @@ def select_and_commit_route(
     catalog_members = {
         toolset: _registry_tool_names(registry, toolset) for toolset in catalog_toolsets
     }
+    catalog_bridge = any(item.name in BRIDGE_TOOL_NAMES for item in envelope.definitions)
 
     # A request_toolset supplied in the host surface stays in envelope order.
     # It is this plugin's own control, so it carries the session catalog
@@ -921,7 +979,7 @@ def select_and_commit_route(
         recovery_payload = thaw_json(envelope_recovery.payload)
         if not _recovery_is_host_locked(envelope_recovery.owner_toolset_at_capture, protected_toolsets, pins):
             recovery_payload = with_capability_catalog(
-                recovery_payload, catalog_toolsets, catalog_members
+                recovery_payload, catalog_toolsets, catalog_members, catalog_bridge
             )
         selected[RECOVERY_TOOL_NAME] = recovery_payload
         selected_owner[RECOVERY_TOOL_NAME] = envelope_recovery.owner_toolset_at_capture
@@ -946,7 +1004,9 @@ def select_and_commit_route(
         if recovery is not None and _tool_name(recovery) == RECOVERY_TOOL_NAME:
             # Agent-local copy carrying the session capability catalog.  Built
             # once here and carried unchanged through later expansions.
-            recovery = with_capability_catalog(recovery, catalog_toolsets, catalog_members)
+            recovery = with_capability_catalog(
+                recovery, catalog_toolsets, catalog_members, catalog_bridge
+            )
             selected[RECOVERY_TOOL_NAME] = recovery
             selected_owner[RECOVERY_TOOL_NAME] = RECOVERY_TOOLSET
 
@@ -981,6 +1041,7 @@ def select_and_commit_route(
             denied_tool_names=tuple(denied_names),
             predicted_toolsets=set(predicted_toolsets),
             initial=True,
+            retained_toolsets=_bridge_only_toolsets(envelope, protected_toolsets),
         )
     except Exception as exc:
         return _failure_result(
@@ -1214,6 +1275,7 @@ def expand_admitted_toolsets(
                 selected_owner[name] for name in added if selected_owner.get(name)
             },
             initial=False,
+            retained_toolsets=_bridge_only_toolsets(envelope, protected_toolsets),
         )
     except Exception as exc:
         _restore_agent_fields(agent, agent_snapshot)
@@ -1272,6 +1334,8 @@ def restore_admitted_envelope(
             denied_tool_names=(),
             predicted_toolsets=set(),
             initial=True,
+            # Exact restore: bridge-only toolsets come back with the envelope.
+            retained_toolsets=tuple(envelope.original_enabled_toolsets or ()),
         )
     except Exception:
         return False
