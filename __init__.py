@@ -16,6 +16,8 @@ from typing import Any, Dict, Optional, Set
 
 try:
     from .config import (
+        _env_override,
+        _get_profile_settings,
         CONFIG_FILE,
         DEFAULT_ROUTER_MODEL,
         DEFAULT_ROUTER_PROVIDER,
@@ -80,6 +82,8 @@ try:
     )
 except ImportError:  # pragma: no cover - direct loader fallback
     from config import (
+        _env_override,
+        _get_profile_settings,
         CONFIG_FILE,
         DEFAULT_ROUTER_MODEL,
         DEFAULT_ROUTER_PROVIDER,
@@ -268,15 +272,19 @@ def on_session_end(**kwargs: Any) -> None:
     if session_id and agent is not None:
         state = _attached_capability_state(agent)
         if state is not None:
-            with _hook_fence(agent, session_id, deadline=time.monotonic() + _hook_commit_budget_s()):
-                restored = _end_session_fenced(agent, state, session_id)
+            with _hook_fence(
+                agent, session_id, deadline=time.monotonic() + _hook_commit_budget_s()
+            ) as fence:
+                restored = _end_session_fenced(agent, state, session_id, fence)
     if session_id and restored:
         _drop_agent_ref(session_id)
 
 
-def _end_session_fenced(agent: Any, state: RouterState, session_id: str) -> bool:
+def _end_session_fenced(
+    agent: Any, state: RouterState, session_id: str, fence: _HookFence | None = None
+) -> bool:
     """Session-end teardown; an abandoned teardown never touches a new lifecycle."""
-    if not _retry_retired_restore(agent, state, session_id):
+    if not _retry_retired_restore(agent, state, session_id, fence):
         # An older session on this agent is still unrestored: this session
         # never routed (quarantine), so there is nothing to undo.
         return True
@@ -319,6 +327,98 @@ def _end_session_fenced(agent: Any, state: RouterState, session_id: str) -> bool
         return False
 
 
+# Process-wide switch set by /router.  None = follow config.yaml (and the
+# HERMES_TOKEN_ROUTER_ENABLED environment override).
+_RUNTIME_OVERRIDE: bool | None = None
+
+
+def _config_enabled(cfg: Any) -> bool:
+    return bool(_is_router_active(cfg) and _get_profile_config(cfg).get("enabled", False))
+
+
+def _router_enabled(cfg: Any) -> bool:
+    """Precedence: HERMES_TOKEN_ROUTER_ENABLED=off (kill switch) > /router > config."""
+    if _env_override() is False:
+        return False
+    runtime = _RUNTIME_OVERRIDE
+    if runtime is not None:
+        return runtime
+    return _config_enabled(cfg)
+
+
+def _routing_settings(cfg: Any) -> dict[str, Any]:
+    """Profile routing settings, independent of whether config enables routing."""
+    return _get_profile_settings(cfg)
+
+
+_ROUTER_HELP = (
+    "Usage: /router on | off | status | reset\n"
+    "  off    stop routing now; a narrowed session gets its full tool list back on the next turn\n"
+    "  on     route new sessions (and sessions not yet routed) from the next turn\n"
+    "  reset  follow the plugin's config.yaml again\n"
+    "  status show the current state\n"
+    "Applies to this Hermes process until it restarts; config.yaml is not changed."
+)
+
+
+def router_command(raw_args: str = "") -> str:
+    """Slash command handler: no model call, no core change."""
+    global _RUNTIME_OVERRIDE
+    arg = (raw_args or "").strip().lower()
+    if arg in {"", "status"}:
+        return _router_status_text()
+    if arg in {"help", "-h", "--help"}:
+        return _ROUTER_HELP
+    if arg in {"off", "disable", "0", "false"}:
+        _RUNTIME_OVERRIDE = False
+        return (
+            "Tool router OFF for this Hermes process. Sessions it narrowed get their full "
+            "tool list back on the next turn. config.yaml is unchanged; /router reset to follow it."
+        )
+    if arg in {"on", "enable", "1", "true"}:
+        if _env_override() is False:
+            return (
+                "Not turned on: HERMES_TOKEN_ROUTER_ENABLED is set to off for this process, "
+                "and that kill switch takes precedence over /router."
+            )
+        _RUNTIME_OVERRIDE = True
+        return (
+            "Tool router ON for this Hermes process from the next turn (a session that was "
+            "already restored to the full list stays full). config.yaml is unchanged."
+        )
+    if arg in {"reset", "default", "config"}:
+        _RUNTIME_OVERRIDE = None
+        return "Tool router follows config.yaml again. " + _router_status_text()
+    return f"Unknown option: {arg}\n\n{_ROUTER_HELP}"
+
+
+def _router_status_text() -> str:
+    runtime = _RUNTIME_OVERRIDE  # one snapshot for the whole message
+    try:
+        cfg = _load_config()
+        settings = _get_profile_settings(cfg)
+        configured = bool(settings.get("enabled", False))
+        profile = settings.get("_profile_name", "unknown")
+        effective = _router_enabled(cfg) if runtime is _RUNTIME_OVERRIDE else bool(runtime)
+    except Exception:  # noqa: BLE001 - status must never fail
+        configured, profile, effective = False, "unknown", False
+    env = _env_override()
+    if env is False:
+        source = "HERMES_TOKEN_ROUTER_ENABLED=off (kill switch; /router on cannot override it)"
+    elif runtime is not None:
+        source = f"/router {'on' if runtime else 'off'}"
+    elif env is True:
+        source = "HERMES_TOKEN_ROUTER_ENABLED=on together with config.yaml"
+    else:
+        source = "config.yaml"
+    return (
+        f"Tool router is {'ON' if effective else 'OFF'} for this process (decided by {source}). "
+        f"config.yaml: {'on' if configured else 'off'} for profile {profile}; "
+        f"environment: {'unset' if env is None else ('on' if env else 'off')}; "
+        f"/router: {'not set' if runtime is None else ('on' if runtime else 'off')}."
+    )
+
+
 def register(ctx) -> None:
     """Register the hermes-token-router plugin.
 
@@ -344,6 +444,17 @@ def register(ctx) -> None:
     ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_hook("pre_tool_call", pre_tool_call)
     ctx.register_hook("on_session_end", on_session_end)
+    try:
+        # /router on|off|status: handled by Hermes's slash-command dispatch,
+        # never sent to the model.
+        ctx.register_command(
+            "router",
+            handler=router_command,
+            description="Turn the tool router on or off for this Hermes process (no model call).",
+            args_hint="on|off|status",
+        )
+    except Exception as exc:  # noqa: BLE001 - older hosts lack register_command
+        logger.debug("%s: /router command unavailable: %s", PLUGIN_NAME, exc)
     try:
         ctx.register_middleware("tool_request", tool_request_middleware)
         _recovery_middleware_registered = True
@@ -697,7 +808,7 @@ def _route_fenced(
     kwargs: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Route body; every mutation below is checked against the hook's fence."""
-    if not _is_router_active(cfg) or not _get_profile_config(cfg).get("enabled", False):
+    if not _router_enabled(cfg):
         # A disabled router must not touch a surface it never narrowed:
         # no capture, no restore (hosts add tools mid-session).  If it did
         # narrow earlier in this session, restore the exact envelope once.
@@ -786,7 +897,7 @@ def _route_fenced(
     if source != "pre_turn_context_build" and _was_turn_routed(agent, state, turn_id):
         return None
 
-    profile_cfg = _get_profile_config(cfg)
+    profile_cfg = _routing_settings(cfg)
     if admission.status != "READY":
         # SAFE_NO_PRUNE restores only its already captured envelope.  All
         # other statuses preserve the current surface and deny additions.
@@ -925,8 +1036,11 @@ def pre_tool_call(**kwargs: Any) -> dict[str, Any] | None:
             return None
         admission = state.bound_host_admission(session_id)
         if admission is None or admission.envelope is None or admission.effective_policy is None:
-            # Agent reused after a failed restore: enforce the retired policy.
-            retired = getattr(state, "_retired_admission", None)
+            # Agent reused after a failed or expired teardown: enforce the
+            # retired (or still-bound, orphaned) policy.
+            retired = getattr(state, "_retired_admission", None) or _orphaned_lifecycle(
+                state, session_id
+            )
             admission = retired[1] if retired is not None else None
         if admission is None or admission.envelope is None or admission.effective_policy is None:
             return None
@@ -990,6 +1104,20 @@ def _hook_commit_budget_s() -> float:
     return timeout * 0.5
 
 
+def _orphaned_lifecycle(state: RouterState, session_id: str) -> tuple[str, Any] | None:
+    """A narrowed surface still bound to another session's admission."""
+    bound_session = getattr(state, "_admission_session_id", None)
+    bound = getattr(state, "_bound_admission_result", None)
+    if (
+        getattr(state, "surface_narrowed", False)
+        and bound_session is not None
+        and bound_session != session_id
+        and bound is not None
+    ):
+        return (bound_session, bound)
+    return None
+
+
 def _retry_retired_restore(
     agent: Any, state: RouterState, session_id: str, fence: _HookFence | None = None
 ) -> bool:
@@ -1006,6 +1134,19 @@ def _retry_retired_restore(
     ambiguous (a partial addition is not a handoff), so the agent stays
     quarantined; recovery is to discard that agent, a fresh one is unaffected.
     """
+    if getattr(state, "_retired_admission", None) is None:
+        orphan = _orphaned_lifecycle(state, session_id)
+        if orphan is None:
+            return True
+        with fenced_section() as may_commit:
+            if not may_commit:
+                return False
+            if getattr(state, "_retired_admission", None) is None and _orphaned_lifecycle(
+                state, session_id
+            ) == orphan:
+                # A teardown expired before recording retirement: adopt the
+                # still-narrowed lifecycle as quarantine.
+                state._retired_admission = orphan
     retired = getattr(state, "_retired_admission", None)
     if retired is None:
         return True
@@ -1324,14 +1465,9 @@ def post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
             requested_tool_names={tool_name},
             caller="post_tool",
             session_id=session_id,
+            claim_retry_for=tool_name,
         )
-        with fenced_section() as may_commit:
-            if (
-                may_commit
-                and tool_name in (getattr(agent, "valid_tool_names", set()) or set())
-                and result.retry_allowed
-            ):
-                state._retry_pending = True
+    del result
     return None
 
 

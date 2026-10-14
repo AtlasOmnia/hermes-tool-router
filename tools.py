@@ -936,6 +936,7 @@ def expand_admitted_toolsets(
     requested_tool_names: set[str],
     caller: str,
     session_id: str,
+    claim_retry_for: str | None = None,
 ) -> ExpansionResult:
     """Apply one truthful expansion transaction for every caller.
 
@@ -952,6 +953,7 @@ def expand_admitted_toolsets(
             requested_tool_names=requested_tool_names,
             caller=caller,
             session_id=session_id,
+            claim_retry_for=claim_retry_for,
         )
         if result.reason != "SURFACE_CHANGED":
             return result
@@ -967,6 +969,7 @@ def _expand_once(
     requested_tool_names: set[str],
     caller: str,
     session_id: str,
+    claim_retry_for: str | None = None,
 ) -> ExpansionResult:
     state = _get_router_state(agent)
     prepared_revision = getattr(state, "surface_revision", 0)
@@ -1205,6 +1208,10 @@ def _expand_once(
                 reason=f"TRANSACTION_ROLLED_BACK:{type(exc).__name__}",
                 retry_allowed=False,
             )
+        if claim_retry_for and claim_retry_for in (getattr(agent, "valid_tool_names", None) or set()):
+            # Claimed in the same critical section as the commit, so two
+            # overlapping automatic recoveries cannot both succeed.
+            state._retry_pending = True
 
     return ExpansionResult(
         ok=not denied_toolsets and not denied_names,

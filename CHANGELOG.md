@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Added
 
+- `/router on|off|status|reset` slash command: switches routing for the running Hermes process without a model call or config change (CLI, desktop/TUI, gateways; not one-shot `-z`). `HERMES_TOKEN_ROUTER_ENABLED=0` stays a kill switch it cannot override; turning a config-disabled profile on keeps that profile's configured settings; status reports config, environment and override separately.
 - Capability awareness after first-turn narrowing: `request_toolset` carries a per-session capability catalog (admitted toolsets with one-line descriptions; partially admitted toolsets list their admitted tools), so "what can you do?" is answered from the catalog instead of from the pruned surface. The `toolsets` parameter description is generated from the registry.
 - Standalone capability questions ("what can you do?", "list your tools", "tell me about your tools") are classified as `capability_inquiry` and keep the small surface; messages that also carry a task keep their normal routing.
 - A `pre_tool_call` guard keeps uncaptured tools of protected toolsets unreachable through Hermes `tool_call` while the surface is narrowed (and, after a failed session-end restore, for a reused agent).
@@ -17,6 +18,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 ### Changed
 
 - Lifecycle fencing: every live entry point (first-turn route, `post_tool_call`, `tool_request` middleware, visible `request_toolset`, `on_session_end`) runs under one fence — lifecycle generation, exact session id, bound admission, and a deadline of half of Hermes's normalized `plugins.hook_callback_timeout` (none when the timeout is disabled). Slow preparation (config, registry, catalog, admission ownership/policy) runs outside the per-agent lock; every coordinated assignment is revalidated under the lock immediately before it is applied, so a hook Hermes abandoned after a timeout never commits into a later session and session end never waits on a stalled hook.
+- Residual limits from review round 9 are fixed: a session end that expires before recording retirement no longer leaves a reused agent unguarded (the still-bound admission is adopted as quarantine); automatic post-tool recovery claims its once-per-turn latch inside the same transaction as its commit; a session end that releases an older quarantine completes its own teardown.
 - Failed session-end restore: the admission and guard are kept, in-flight hooks of that session are revoked, and the restore is retried at the next turn or session end. A reused agent is quarantined (no capture or routing, retired policy still guards protected tools); it is released only by restoring the retired envelope while the agent shows exactly the router's last committed surface. Any other change is treated as ambiguous; recovery is to discard the agent.
 - Expansions are prepared against a surface revision and recomputed (up to 3 times) if another commit landed first, so overlapping recoveries never drop each other's tools. Automatic post-tool recovery is limited to once per turn (latch revalidated at commit; an explicit `request_toolset` does not reset it).
 - Classifier: confidence must be in [0, 1] after the one tolerant rescale ("95%", `"0.93"`; 101 or "250%" fail open), any unknown toolset name fails open, and the HTTP timeout equals the routing hard timeout. Parsing is one strict fail-open contract (`parse_classifier_payload`) shared with `classifier.parse_classifier_output`.
@@ -40,9 +42,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Known limits
 
-- A session end that exceeds its deadline skips retirement bookkeeping, so if Hermes then reuses that unchanged agent the protected-tool guard has no retired policy to enforce.
-- Two post-tool callbacks interleaving between one's commit and its latch can still admit two automatic recoveries in one turn.
-- A session end that releases an older quarantine keeps its own cached agent reference until the next session end.
 - Disabling after narrowing restores the captured surface once and drops tools added while narrowed; re-enabling in the same session does not narrow again. The guard lets connector (`connectors__*`) and unregistered names through.
 
 Review history: dev-critic2 rounds 1-9 on the capability-catalog / compatibility work; round 9 verdict ship (medium confidence).

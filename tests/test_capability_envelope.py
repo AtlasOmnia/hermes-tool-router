@@ -3920,3 +3920,191 @@ def test_stale_visible_request_reports_stale_lifecycle(monkeypatch: pytest.Monke
     )
     assert holder["out"]["ok"] is False and holder["out"]["reason"] == "STALE_LIFECYCLE"
     assert router._get_router_state(agent)._admission_session_id is None
+
+
+# --- Residual limits (round 9) and /router -------------------------------
+
+
+def test_expired_teardown_then_reuse_keeps_guard_and_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "r9-orphan", config)
+    state = router._get_router_state(agent)
+    monkeypatch.setattr(router, "_hook_commit_budget_s", lambda: -1.0)
+    router.on_session_end(session_id="r9-orphan", agent=agent)  # expires: no bookkeeping
+    assert state._retired_admission is None and state.surface_narrowed is True
+    monkeypatch.setattr(router, "_hook_commit_budget_s", lambda: 15.0)
+    agent.session_id = "r9-orphan-new"
+    blocked = router.pre_tool_call(tool_name="kanban_sibling", session_id="r9-orphan-new", args={})
+    assert blocked and blocked["action"] == "block"
+    # The unchanged narrowed surface is restored and the agent released.
+    _route(agent, "r9-o-1", "")
+    assert state._retired_admission is None
+    assert state.surface_narrowed is False
+    assert "kanban_show" in _rev6_names(agent)
+
+
+def test_expired_teardown_then_host_change_stays_quarantined(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "r9-orphan2", config)
+    state = router._get_router_state(agent)
+    monkeypatch.setattr(router, "_hook_commit_budget_s", lambda: -1.0)
+    router.on_session_end(session_id="r9-orphan2", agent=agent)
+    monkeypatch.setattr(router, "_hook_commit_budget_s", lambda: 15.0)
+    agent.session_id = "r9-orphan2-new"
+    changed = list(agent.tools[:1])
+    agent.tools = changed
+    _route(agent, "r9-o2-1", "search the web for news")
+    assert agent.tools == changed
+    assert state._retired_admission is not None
+    blocked = router.pre_tool_call(tool_name="kanban_sibling", session_id="r9-orphan2-new", args={})
+    assert blocked and blocked["action"] == "block"
+
+
+def test_post_tool_expansion_claims_latch_inside_the_transaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    _registry, agent = _three_tool_agent(monkeypatch, "r9-claim")
+    _route(agent, "r9-claim-1", "search the web for news")
+    state = router._get_router_state(agent)
+    admission = state.bound_host_admission("r9-claim")
+    result = sys.modules[_TOOLS_MOD].expand_admitted_toolsets(
+        agent,
+        admission,
+        requested_toolsets=set(),
+        requested_tool_names={"run_command"},
+        caller="post_tool",
+        session_id="r9-claim",
+        claim_retry_for="run_command",
+    )
+    assert result.ok and state._retry_pending is True
+
+
+def test_session_end_releasing_old_quarantine_completes_its_own_teardown(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent, state = _quarantined_agent(monkeypatch, "r9-teardown")
+    router._store_agent_ref(agent, agent.session_id)
+    router.on_session_end(session_id=agent.session_id, agent=agent)
+    assert state._retired_admission is None
+    assert router._get_agent_ref(agent.session_id) is None
+
+
+def test_router_command_toggles_without_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(router, "_RUNTIME_OVERRIDE", None)
+    registry, agent = _three_tool_agent(monkeypatch, "r9-cmd")
+    _route(agent, "r9-cmd-1", "search the web for news")
+    state = router._get_router_state(agent)
+    assert state.surface_narrowed is True
+    assert "ON" in router.router_command("status")
+    assert "OFF" in router.router_command("off")
+    _route(agent, "r9-cmd-2", "next")
+    assert state.surface_narrowed is False
+    assert {"web_search", "read_file", "run_command"} <= set(_rev6_names(agent))
+    assert "OFF" in router.router_command("status")
+    # A fresh session routes again once switched back on.
+    router.router_command("on")
+    fresh = _rev6_agent(
+        registry, "r9-cmd-fresh", names=("web_search", "read_file", "run_command"), enabled=("web", "file", "terminal"),
+    )
+    assert _rev6_admit(fresh, monkeypatch, owned=False).status == "READY"
+    _route(fresh, "r9-cmd-3", "search the web for news")
+    assert router._get_router_state(fresh).surface_narrowed is True
+    assert "follows config.yaml" in router.router_command("reset")
+    assert router._RUNTIME_OVERRIDE is None
+    assert "Usage" in router.router_command("bogus")
+
+
+def test_router_command_registered_as_slash_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("_registration_checked", "_recovery_middleware_registered", "_recovery_tool_registered"):
+        monkeypatch.setattr(router, name, getattr(router, name))
+    recorded: dict[str, Any] = {}
+
+    class Ctx:
+        def register_hook(self, *a: Any, **k: Any) -> None: ...
+        def register_middleware(self, *a: Any, **k: Any) -> None: ...
+
+        def register_command(self, name: str, handler: Any, **kwargs: Any) -> None:
+            recorded[name] = (handler, kwargs)
+
+    router.register(Ctx())
+    assert "router" in recorded
+    assert recorded["router"][0] is router.router_command
+
+
+# --- Review round 10 amendments ------------------------------------------
+
+
+def test_env_kill_switch_beats_router_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(router, "_RUNTIME_OVERRIDE", None)
+    monkeypatch.setenv("HERMES_TOKEN_ROUTER_ENABLED", "0")
+    _registry, agent = _three_tool_agent(monkeypatch, "r10-env")
+    out = router.router_command("on")
+    assert "kill switch" in out and router._RUNTIME_OVERRIDE is None
+    monkeypatch.setattr(router, "_RUNTIME_OVERRIDE", True)  # even if set some other way
+    _route(agent, "r10-env-1", "search the web for news")
+    assert router._get_router_state(agent).surface_narrowed is False
+    assert "HERMES_TOKEN_ROUTER_ENABLED=off" in router.router_command("status")
+
+
+def test_router_on_uses_the_profiles_configured_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    disabled = {"global": {**_base_config(), "enabled": False, "floor_toolsets": ["terminal"]}}
+    monkeypatch.setattr(router, "_load_config", lambda: disabled)
+    monkeypatch.setenv("HERMES_PROFILE", "probe")
+    monkeypatch.delenv("HERMES_TOKEN_ROUTER_ENABLED", raising=False)
+    config_mod = sys.modules["hermes_token_router_plugin.config"]
+    monkeypatch.setattr(router, "_get_profile_config", config_mod._get_profile_config)
+    monkeypatch.setattr(router, "_RUNTIME_OVERRIDE", True)
+    agent = _rev6_agent(
+        registry, "r10-settings", names=("web_search", "read_file", "run_command"), enabled=("web", "file", "terminal"),
+    )
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    _route(agent, "r10-s-1", "search the web for news")
+    names = _rev6_names(agent)
+    assert "web_search" in names and "run_command" in names  # configured floor kept
+
+
+def test_router_status_reports_each_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(router, "_RUNTIME_OVERRIDE", None)
+    monkeypatch.delenv("HERMES_TOKEN_ROUTER_ENABLED", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "probe")
+    monkeypatch.setattr(router, "_load_config", lambda: {"global": {"enabled": True}})
+    assert "decided by config.yaml" in router.router_command("status")
+    monkeypatch.setenv("HERMES_TOKEN_ROUTER_ENABLED", "0")
+    status = router.router_command("status")
+    assert "OFF" in status and "config.yaml: on" in status and "environment: off" in status
+    monkeypatch.delenv("HERMES_TOKEN_ROUTER_ENABLED")
+    router.router_command("off")
+    status = router.router_command("status")
+    assert "decided by /router off" in status and "config.yaml: on" in status
+
+
+def test_overlapping_post_tool_at_return_boundary_recovers_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    _registry, agent = _three_tool_agent(monkeypatch, "r10-latch")
+    _route(agent, "r10-latch-1", "search the web for news")
+    state = router._get_router_state(agent)
+    real_expand = router.expand_admitted_toolsets
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def expand_then_pause(*args: Any, **kwargs: Any) -> Any:
+        result = real_expand(*args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            entered.set()  # committed, returned, latch handling not yet done before the fix
+            release.wait(5)
+        return result
+
+    monkeypatch.setattr(router, "expand_admitted_toolsets", expand_then_pause)
+    first = threading.Thread(
+        target=lambda: router.post_tool_call(agent=agent, session_id="r10-latch", tool_name="run_command", args={})
+    )
+    first.start()
+    assert entered.wait(5)
+    router.post_tool_call(agent=agent, session_id="r10-latch", tool_name="read_file", args={})
+    release.set()
+    first.join(5)
+    names = _rev6_names(agent)
+    assert "run_command" in names and "read_file" not in names
+    assert state._retry_pending is True
