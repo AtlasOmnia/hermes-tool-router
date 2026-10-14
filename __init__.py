@@ -9,6 +9,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import time
 from typing import Any, Dict, Optional, Set
 
 try:
@@ -541,25 +542,39 @@ def on_session_end(**kwargs: Any) -> None:
     agent = kwargs.get("agent")
     if agent is None and session_id:
         agent = _get_agent_ref(session_id)
+    if session_id and agent is not None and not _agent_session_matches_id(agent, session_id):
+        # Never tear down another session's agent.
+        agent = None
+    restored = True
     if session_id and agent is not None:
         state = _attached_capability_state(agent)
         if state is not None:
-            restored = True
-            if getattr(state, "surface_narrowed", False):
-                bound = state.bound_host_admission(session_id)
-                restored = bool(
-                    bound is not None
-                    and bound.envelope is not None
-                    and bound.status in {"READY", "SAFE_NO_PRUNE"}
-                    and restore_admitted_envelope(agent, bound)
-                )
-            state.end_admission(session_id)
-            if restored:
-                # A reused agent object starts its next session fresh.  If the
-                # narrowed surface could not be restored, keep the sticky
-                # markers so it is never recaptured as fresh authority.
-                state.reset()
-    if session_id:
+            with state.mutation_lock:
+                if getattr(state, "surface_narrowed", False):
+                    bound = state.bound_host_admission(session_id)
+                    restored = bool(
+                        bound is not None
+                        and bound.envelope is not None
+                        and bound.status in {"READY", "SAFE_NO_PRUNE"}
+                        and restore_admitted_envelope(agent, bound)
+                    )
+                if restored:
+                    # Retire the lifecycle; a reused agent object starts its
+                    # next session fresh, and in-flight hooks from this
+                    # session can no longer commit (generation bump).
+                    state.end_admission(session_id)
+                    state.reset()
+                else:
+                    # Keep the admission, the narrowed markers and the agent
+                    # reference: the protected-tool guard stays engaged and a
+                    # later disabled turn or session end can retry the restore.
+                    logger.warning(
+                        "%s: could not restore the narrowed surface at session end for %s; "
+                        "keeping its admission so enforcement and retry remain possible",
+                        PLUGIN_NAME,
+                        session_id,
+                    )
+    if session_id and restored:
         _drop_agent_ref(session_id)
 
 
@@ -1000,6 +1015,8 @@ def _route_tool_surface(
         return None
 
     state = _get_router_state(agent)
+    route_generation = state.lifecycle_generation
+    route_started = time.monotonic()
     if not _is_router_active(cfg) or not _get_profile_config(cfg).get("enabled", False):
         # A disabled router must not touch a surface it never narrowed:
         # no capture, no restore (hosts add tools mid-session).  If it did
@@ -1016,10 +1033,11 @@ def _route_tool_surface(
                 and bound.envelope is not None
             ):
                 restored = bool(restore_admitted_envelope(agent, bound))
-            if not restored:
+            if not restored and getattr(state, "_restore_warned_session", None) != session_id:
+                state._restore_warned_session = session_id
                 logger.warning(
                     "%s: router disabled but the narrowed surface could not be restored "
-                    "for session %s; will retry next turn",
+                    "for session %s; will retry every turn",
                     PLUGIN_NAME,
                     session_id,
                 )
@@ -1139,14 +1157,27 @@ def _route_tool_surface(
             _mark_turn_routed(agent, state, turn_id, source)
         return None
 
-    result = select_and_commit_route(
-        agent,
-        admission,
-        predicted_toolsets=set(predicted),
-        floor_toolsets=floor_toolsets,
-        available_toolsets=available,
-        caller="route",
-    )
+    with state.mutation_lock:
+        if (
+            state.lifecycle_generation != route_generation
+            or not _agent_session_matches_id(agent, session_id)
+            or state.bound_host_admission(session_id) is not admission
+            or time.monotonic() - route_started > _route_commit_deadline_s()
+        ):
+            # Late or stale hook (abandoned by a Hermes hook timeout, session
+            # ended or agent reused meanwhile): never commit.
+            logger.warning(
+                "%s: discarding a stale route for session %s", PLUGIN_NAME, session_id
+            )
+            return None
+        result = select_and_commit_route(
+            agent,
+            admission,
+            predicted_toolsets=set(predicted),
+            floor_toolsets=floor_toolsets,
+            available_toolsets=available,
+            caller="route",
+        )
     state.last_expansion_result = result
     if source == "pre_turn_context_build":
         _mark_turn_routed(agent, state, turn_id, source)
@@ -1221,6 +1252,26 @@ def pre_tool_call(**kwargs: Any) -> dict[str, Any] | None:
             ),
         }
     return None
+
+
+# Hermes abandons (but does not cancel) timeout-bounded hook callbacks after
+# plugins.hook_callback_timeout (default 30 s).  A route that has not committed
+# well before that must not commit at all.
+_DEFAULT_HOOK_CALLBACK_TIMEOUT_S = 30.0
+
+
+def _route_commit_deadline_s() -> float:
+    timeout = _DEFAULT_HOOK_CALLBACK_TIMEOUT_S
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        plugins_cfg = (load_config_readonly() or {}).get("plugins") or {}
+        configured = float(plugins_cfg.get("hook_callback_timeout", timeout))
+        if configured > 0:
+            timeout = configured
+    except Exception as exc:  # noqa: BLE001 - standalone/older hosts use the default
+        logger.debug("%s: hook_callback_timeout unavailable (%s); using %ss", PLUGIN_NAME, exc, timeout)
+    return max(0.5, timeout * 0.5)
 
 
 def _resolve_hook_agent(explicit: Any, session_id: Any) -> Any:
@@ -1447,17 +1498,23 @@ def post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
     state = _get_router_state(agent)
     if state._retry_pending or tool_name in (getattr(agent, "valid_tool_names", set()) or set()):
         return None
+    generation = state.lifecycle_generation
     admission = _call_admission_for_current(
         "post_tool", agent, session_id, kwargs
     )
-    result = expand_admitted_toolsets(
-        agent,
-        admission,
-        requested_toolsets=set(),
-        requested_tool_names={tool_name},
-        caller="post_tool",
-        session_id=session_id,
-    )
+    with state.mutation_lock:
+        if state.lifecycle_generation != generation or not _agent_session_matches_id(
+            agent, session_id
+        ):
+            return None
+        result = expand_admitted_toolsets(
+            agent,
+            admission,
+            requested_toolsets=set(),
+            requested_tool_names={tool_name},
+            caller="post_tool",
+            session_id=session_id,
+        )
     if tool_name in (getattr(agent, "valid_tool_names", set()) or set()) and result.retry_allowed:
         state._retry_pending = True
     return None

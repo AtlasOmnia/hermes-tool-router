@@ -77,6 +77,7 @@ _INVENTORY_FILLER = frozenset(
         "i", "in", "is", "just", "loaded", "me", "now", "of", "ok", "okay", "please",
         "right", "session", "so", "the", "there", "these", "this", "to", "today", "use",
         "using", "what", "which", "with", "you", "your", "yours", "exactly", "thanks", "thank",
+        "about",
         "quick", "question", "would", "like", "i'd", "id", "at", "as", "kind", "kinds", "sort",
         "sorts", "type", "types", "on", "hello", "there's", "what's", "whats", "you've", "youve"
     ]

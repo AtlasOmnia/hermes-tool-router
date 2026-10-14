@@ -82,6 +82,7 @@ CAPABILITY_PROMPTS = (
     "What tools do you have at your disposal?",
     "Please list all of your tools, thanks",
     "What tools can you actually use?",
+    "Tell me about your tools",
 )
 
 NOT_CAPABILITY_PROMPTS = (

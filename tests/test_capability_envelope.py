@@ -3281,3 +3281,101 @@ def test_own_stack_checks_session_before_touching_foreign_properties() -> None:
     agent = Foreign()  # noqa: F841 - live local for the own-stack walk
     assert state_mod._get_agent_from_stack("my-session", scan_threads=False) is None
     assert touched == []
+
+
+
+# --- Review round 5 regressions ------------------------------------------
+
+
+def _fail_restore_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = router.restore_admitted_envelope
+    calls = {"n": 0}
+
+    def flaky(*args: Any, **kwargs: Any) -> bool:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return False
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(router, "restore_admitted_envelope", flaky)
+
+
+def test_failed_session_end_restore_keeps_admission_guard_and_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "failed-end", config)
+    state = router._get_router_state(agent)
+    _fail_restore_once(monkeypatch)
+    router.on_session_end(session_id=agent.session_id, agent=agent)
+    assert state.surface_narrowed is True
+    assert state.bound_host_admission(agent.session_id) is not None
+    blocked = router.pre_tool_call(tool_name="kanban_sibling", session_id=agent.session_id, args={})
+    assert blocked and blocked["action"] == "block"
+    # Retry: a second session end (or a disabled turn) restores and retires.
+    router.on_session_end(session_id=agent.session_id, agent=agent)
+    assert state.surface_narrowed is False
+    assert state.bound_host_admission(agent.session_id) is None
+    assert "web_search" in _rev6_names(agent)
+
+
+def test_failed_session_end_then_disabled_turn_restores(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "failed-end-disabled", config)
+    state = router._get_router_state(agent)
+    _fail_restore_once(monkeypatch)
+    router.on_session_end(session_id=agent.session_id, agent=agent)
+    config["enabled"] = False
+    _route(agent, "failed-end-disabled-2", "next")
+    assert state.surface_narrowed is False
+    assert "web_search" in _rev6_names(agent)
+
+
+def test_stale_route_after_session_end_and_reuse_never_commits(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(registry, "stale-old", names=("web_search", "read_file"), enabled=("web", "file"))
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    entered = threading.Event()
+    release = threading.Event()
+    real_rules = router._predict_toolsets_by_rules
+
+    def paused_rules(message: str, available: set[str]):
+        entered.set()
+        release.wait(5)
+        return real_rules(message, available)
+
+    monkeypatch.setattr(router, "_predict_toolsets_by_rules", paused_rules)
+    worker = threading.Thread(
+        target=lambda: router.pre_turn_context_build(
+            agent=agent, session_id="stale-old", turn_id="s-1", user_message="search the web for news",
+        )
+    )
+    worker.start()
+    assert entered.wait(5)
+    # The host gives up on the hook, ends the session and reuses the agent.
+    router.on_session_end(session_id="stale-old", agent=agent)
+    file_only = [registry.definitions["read_file"]]
+    agent.session_id = "stale-new"
+    agent.tools = list(file_only)
+    agent.valid_tool_names = {"read_file"}
+    agent.enabled_toolsets = ["file"]
+    release.set()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert agent.tools == file_only
+    assert agent.enabled_toolsets == ["file"]
+    assert router._get_router_state(agent).surface_narrowed is False
+
+
+def test_route_commit_deadline_discards_slow_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(registry, "deadline", names=("web_search", "read_file"), enabled=("web", "file"))
+    before = list(agent.tools)
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    monkeypatch.setattr(router, "_route_commit_deadline_s", lambda: -1.0)
+    _route(agent, "deadline-1", "search the web for news")
+    assert agent.tools == before

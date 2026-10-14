@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Dict, List, Optional, Set
 
 try:
@@ -142,6 +143,12 @@ class RouterState:
         # True only while this router has replaced the host surface with a
         # narrowed one; a disabled router restores once, then stays hands-off.
         self.surface_narrowed: bool = False
+        # Lifecycle fence: bumped at session end/reset.  A hook that started
+        # under an older generation (e.g. abandoned by a Hermes hook timeout
+        # and released later) must not commit.  The lock serializes route
+        # commits with session-end teardown.
+        self.lifecycle_generation: int = 0
+        self.mutation_lock = threading.RLock()
         self.initial_toolsets: Set[str] = set()
         self.active_toolsets: Set[str] = set()
         self.registry_generation: int = 0
@@ -327,6 +334,7 @@ class RouterState:
         self.routed_source = None
         self.initial_route_applied = False
         self.surface_narrowed = False
+        self.lifecycle_generation = getattr(self, "lifecycle_generation", 0) + 1
         self.initial_toolsets = set()
         self.active_toolsets = set()
         self.registry_generation = 0
