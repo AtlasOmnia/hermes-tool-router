@@ -544,7 +544,21 @@ def on_session_end(**kwargs: Any) -> None:
     if session_id and agent is not None:
         state = _attached_capability_state(agent)
         if state is not None:
+            restored = True
+            if getattr(state, "surface_narrowed", False):
+                bound = state.bound_host_admission(session_id)
+                restored = bool(
+                    bound is not None
+                    and bound.envelope is not None
+                    and bound.status in {"READY", "SAFE_NO_PRUNE"}
+                    and restore_admitted_envelope(agent, bound)
+                )
             state.end_admission(session_id)
+            if restored:
+                # A reused agent object starts its next session fresh.  If the
+                # narrowed surface could not be restored, keep the sticky
+                # markers so it is never recaptured as fresh authority.
+                state.reset()
     if session_id:
         _drop_agent_ref(session_id)
 
@@ -974,6 +988,11 @@ def _route_tool_surface(
             )
         else:
             agent = _get_agent_from_stack() or _get_agent_ref(None)
+    elif kwargs.get("session_id") and not _agent_session_matches_id(
+        agent, str(kwargs.get("session_id"))
+    ):
+        # An explicit agent from another session is never routed or cached.
+        return None
     session_id = str(kwargs.get("session_id") or getattr(agent, "session_id", "") or "")
     if agent is not None:
         _store_agent_ref(agent, session_id)
@@ -985,15 +1004,25 @@ def _route_tool_surface(
         # A disabled router must not touch a surface it never narrowed:
         # no capture, no restore (hosts add tools mid-session).  If it did
         # narrow earlier in this session, restore the exact envelope once.
+        # The flag is cleared only by a successful restore (inside
+        # restore_admitted_envelope), so a failed or impossible restore keeps
+        # the protected-tool guard engaged and is retried next turn.
         if getattr(state, "surface_narrowed", False):
             bound = state.bound_host_admission(session_id)
+            restored = False
             if (
                 bound is not None
                 and bound.status in {"READY", "SAFE_NO_PRUNE"}
                 and bound.envelope is not None
             ):
-                restore_admitted_envelope(agent, bound)
-            state.surface_narrowed = False
+                restored = bool(restore_admitted_envelope(agent, bound))
+            if not restored:
+                logger.warning(
+                    "%s: router disabled but the narrowed surface could not be restored "
+                    "for session %s; will retry next turn",
+                    PLUGIN_NAME,
+                    session_id,
+                )
         state.active = False
         state.predicted_toolsets = None
         return None
@@ -1022,15 +1051,6 @@ def _route_tool_surface(
 
     user_message = kwargs.get("user_message", "")
     turn_id = kwargs.get("turn_id") or getattr(agent, "_current_turn_id", "") or ""
-    current_profile_cfg = _get_profile_config(cfg)
-    if not _is_router_active(cfg) or not current_profile_cfg.get("enabled", False):
-        if admission.status in {"READY", "SAFE_NO_PRUNE"} and admission.envelope is not None:
-            restore_admitted_envelope(agent, admission)
-        state.active = False
-        state.predicted_toolsets = None
-        if source == "pre_turn_context_build":
-            _mark_turn_routed(agent, state, turn_id, source)
-        return None
     if not user_message:
         # Admission is intentionally bound before this return.  Do not run
         # classifier, available-toolset, retrieval, recovery, or retry work.
@@ -1053,14 +1073,6 @@ def _route_tool_surface(
         return None
 
     profile_cfg = _get_profile_config(cfg)
-    if not profile_cfg.get("enabled", False):
-        if admission.status in {"READY", "SAFE_NO_PRUNE"} and admission.envelope is not None:
-            restore_admitted_envelope(agent, admission)
-        state.active = False
-        state.predicted_toolsets = None
-        if source == "pre_turn_context_build":
-            _mark_turn_routed(agent, state, turn_id, source)
-        return None
     if admission.status != "READY":
         # SAFE_NO_PRUNE restores only its already captured envelope.  All
         # other statuses preserve the current surface and deny additions.

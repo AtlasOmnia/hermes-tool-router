@@ -75,6 +75,13 @@ CAPABILITY_PROMPTS = (
     "Tell me your capabilities",
     "What integrations do you have?",
     "What can you help me with?",
+    # Review round 4 positives.
+    "Could you tell me what tools you have?",
+    "What capabilities do you offer?",
+    "Quick question: what tools do you have?",
+    "What tools do you have at your disposal?",
+    "Please list all of your tools, thanks",
+    "What tools can you actually use?",
 )
 
 NOT_CAPABILITY_PROMPTS = (
@@ -97,6 +104,11 @@ NOT_CAPABILITY_PROMPTS = (
     "What tools do you have for git? commit my changes",
     "Tell me about your available tools for image generation and then generate a cat picture",
     "What tools do you have access to? Then read notes.txt",
+    # Review round 4: task text inside the matched phrase.
+    "Show my cron jobs using your tools",
+    "Show my task list with your tools",
+    "List cronjob with your tools",
+    "What tools are installed on my machine?",
 )
 
 

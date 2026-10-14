@@ -3156,3 +3156,128 @@ def test_restore_assigns_the_exact_captured_enabled_list(monkeypatch: pytest.Mon
         assert admission.status == "READY"
         assert router.restore_admitted_envelope(agent, admission) is True
         assert list(agent.enabled_toolsets) == list(enabled)
+
+
+
+# --- Review round 4 regressions ------------------------------------------
+
+
+def _narrowed_protected_bridge_agent(monkeypatch: pytest.MonkeyPatch, session: str, config: dict) -> Any:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    monkeypatch.setattr(router, "_load_config", lambda: {"global": config})
+    monkeypatch.setattr(router, "_get_profile_config", lambda *a, **k: config)
+    monkeypatch.setattr(router, "_get_available_toolsets", lambda: set(registry.toolsets))
+    agent = _rev6_agent(
+        registry,
+        session,
+        names=("web_search", "kanban_show", "tool_search", "tool_describe", "tool_call"),
+        enabled=("web", "kanban"),
+    )
+    metadata = {"schema_version": 1, "protected_toolsets": ["kanban"], "pinned_tool_names": ["kanban_show"]}
+    assert _rev6_admit(agent, monkeypatch, hook_metadata=metadata, owned=False).status == "READY"
+    _route(agent, f"{session}-1", "What can you do?")
+    return agent
+
+
+def _base_config() -> dict:
+    return {
+        "enabled": True, "long_message_decline_chars": 10_000, "short_message_bypass_chars": 0,
+        "floor_toolsets": [], "deterministic_rules_enabled": True, "confidence_threshold": 0.0,
+        "router_hard_timeout_ms": 1_200, "classifier": {"enabled": False},
+    }
+
+
+def test_failed_disable_restore_keeps_guard_and_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "failed-restore", config)
+    blocked = router.pre_tool_call(tool_name="kanban_sibling", session_id=agent.session_id, args={})
+    assert blocked and blocked["action"] == "block"
+    config["enabled"] = False
+    real_restore = router.restore_admitted_envelope
+    monkeypatch.setattr(router, "restore_admitted_envelope", lambda *a, **k: False)
+    _route(agent, "failed-restore-2", "next")
+    state = router._get_router_state(agent)
+    assert state.surface_narrowed is True
+    still = router.pre_tool_call(tool_name="kanban_sibling", session_id=agent.session_id, args={})
+    assert still and still["action"] == "block"
+    monkeypatch.setattr(router, "restore_admitted_envelope", real_restore)
+    _route(agent, "failed-restore-3", "again")
+    assert state.surface_narrowed is False
+    assert "kanban_show" in _rev6_names(agent) and "web_search" in _rev6_names(agent)
+
+
+def test_explicit_route_agent_from_another_session_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(registry, "actual-explicit", names=("web_search", "read_file"), enabled=("web", "file"))
+    before = list(agent.tools)
+    router._drop_agent_ref("wrong-explicit")
+    router.pre_turn_context_build(
+        agent=agent, session_id="wrong-explicit", turn_id="w", user_message="search the web",
+    )
+    assert agent.tools == before
+    assert router._get_agent_ref("wrong-explicit") is not agent
+
+
+def test_thread_scan_treats_agent_and_self_duplicates_as_ambiguous() -> None:
+    import threading
+
+    state_mod = sys.modules["hermes_token_router_plugin.state"]
+    first = SimpleNamespace(session_id="tier-dup", tools=[], valid_tool_names=set(), enabled_toolsets=[])
+    second = SimpleNamespace(session_id="tier-dup", tools=[], valid_tool_names=set(), enabled_toolsets=[])
+    release = threading.Event()
+    ready = [threading.Event(), threading.Event()]
+
+    def as_agent() -> None:
+        agent = first  # noqa: F841
+        ready[0].set()
+        release.wait(5)
+
+    def as_self() -> None:
+        self = second  # noqa: F841
+        ready[1].set()
+        release.wait(5)
+
+    threads = [threading.Thread(target=as_agent), threading.Thread(target=as_self)]
+    for thread in threads:
+        thread.start()
+    try:
+        assert all(event.wait(5) for event in ready)
+        assert state_mod._find_agent_in_threads("tier-dup") is None
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(5)
+
+
+def test_session_end_restores_and_resets_for_agent_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "session-end", config)
+    state = router._get_router_state(agent)
+    assert state.surface_narrowed is True
+    router.on_session_end(session_id=agent.session_id, agent=agent)
+    assert state.surface_narrowed is False
+    assert state.initial_route_applied is False
+    assert "web_search" in _rev6_names(agent) and "kanban_show" in _rev6_names(agent)
+    state.surface_narrowed = True
+    state.reset()
+    assert state.surface_narrowed is False
+
+
+def test_own_stack_checks_session_before_touching_foreign_properties() -> None:
+    state_mod = sys.modules["hermes_token_router_plugin.state"]
+    touched: list[str] = []
+
+    class Foreign:
+        session_id = "someone-else"
+
+        @property
+        def tools(self):
+            touched.append("tools")
+            raise RuntimeError("must not be read")
+
+    agent = Foreign()  # noqa: F841 - live local for the own-stack walk
+    assert state_mod._get_agent_from_stack("my-session", scan_threads=False) is None
+    assert touched == []

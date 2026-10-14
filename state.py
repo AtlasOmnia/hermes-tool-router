@@ -49,8 +49,10 @@ def _get_agent_from_stack(session_id: str | None = None, scan_threads: bool = Tr
         # Walk up the stack looking for a frame with an 'agent' local
         while frame is not None:
             agent = frame.f_locals.get("agent")
-            if agent is not None and _looks_like_agent(agent) and (
-                not session_id or _agent_session_matches(agent, session_id)
+            if (
+                agent is not None
+                and (not session_id or _agent_session_matches(agent, session_id))
+                and _looks_like_agent(agent)
             ):
                 return agent
             frame = frame.f_back
@@ -95,8 +97,8 @@ def _find_agent_in_threads(session_id: str) -> Any:
     except Exception:  # noqa: BLE001 - introspection unavailable: no agent
         return None
     try:
+        matches: dict[int, Any] = {}
         for local_name in ("agent", "self"):
-            matches: dict[int, Any] = {}
             for thread_id, frame in frames.items():
                 if thread_id == own:
                     continue
@@ -112,10 +114,11 @@ def _find_agent_in_threads(session_id: str) -> Any:
                     ):
                         matches[id(candidate)] = candidate
                     frame = frame.f_back
-            if len(matches) == 1:
-                return next(iter(matches.values()))
-            if len(matches) > 1:
-                return None
+        # Distinct agent-shaped objects with the same session id, held as
+        # either `agent` or `self` anywhere, are ambiguous: bind nothing.
+        if len(matches) == 1:
+            return next(iter(matches.values()))
+        return None
     finally:
         del frames
     return None
@@ -323,6 +326,7 @@ class RouterState:
         self.routed_turn_id = None
         self.routed_source = None
         self.initial_route_applied = False
+        self.surface_narrowed = False
         self.initial_toolsets = set()
         self.active_toolsets = set()
         self.registry_generation = 0

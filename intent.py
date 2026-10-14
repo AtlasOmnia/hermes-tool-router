@@ -62,13 +62,23 @@ _CAPABILITY_INQUIRY = re.compile(
     re.IGNORECASE,
 )
 _CAPABILITY_INQUIRY_MAX_CHARS = 160
+_INVENTORY_TERMS = frozenset(
+    [
+        "tool", "tools", "toolset", "toolsets", "capability", "capabilities", "ability",
+        "abilities", "integration", "integrations", "list", "show", "enumerate", "tell",
+        "else", "able", "capable", "assistant", "toolbox", "disposal", "equipped", "support",
+        "offer", "expose", "provide", "actually", "know", "u", "yourself",
+    ]
+)
 _INVENTORY_FILLER = frozenset(
     [
         "a", "access", "all", "an", "any", "are", "available", "can", "could", "currently",
         "do", "does", "enabled", "for", "got", "have", "has", "help", "here", "hey", "hi",
         "i", "in", "is", "just", "loaded", "me", "now", "of", "ok", "okay", "please",
         "right", "session", "so", "the", "there", "these", "this", "to", "today", "use",
-        "using", "what", "which", "with", "you", "your", "yours", "exactly"
+        "using", "what", "which", "with", "you", "your", "yours", "exactly", "thanks", "thank",
+        "quick", "question", "would", "like", "i'd", "id", "at", "as", "kind", "kinds", "sort",
+        "sorts", "type", "types", "on", "hello", "there's", "what's", "whats", "you've", "youve"
     ]
 )
 _ASSISTANT_DIRECTED = re.compile(
@@ -108,13 +118,12 @@ def _is_capability_inquiry(text: str) -> bool:
     match = _CAPABILITY_INQUIRY.search(text)
     if not match or not _ASSISTANT_DIRECTED.search(text):
         return False
-    # The whole message must be an inventory question: whatever is left
-    # outside the matched phrase may only be filler ("do you have", "right
-    # now", "please").  "List your tools and schedule a reminder" leaves
-    # "schedule", "reminder" -> not an inventory question.
-    remainder = (text[: match.start()] + " " + text[match.end():]).lower()
-    leftover = [word for word in re.findall(r"[a-z']+", remainder) if word not in _INVENTORY_FILLER]
-    return not leftover
+    # The whole message must be an inventory question: every word, inside
+    # or outside the matched phrase, must be inventory vocabulary or filler.
+    # "List your tools and schedule a reminder" ("schedule", "reminder") and
+    # "Show my cron jobs using your tools" ("my", "cron", "jobs") are tasks.
+    words = re.findall(r"[a-z']+", text.lower())
+    return all(word in _INVENTORY_FILLER or word in _INVENTORY_TERMS for word in words)
 
 
 def classify_intent(message: str) -> IntentResult:
