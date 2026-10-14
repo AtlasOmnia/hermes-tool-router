@@ -2871,3 +2871,69 @@ def test_catalog_copy_parameter_names_the_session_catalog() -> None:
     assert "capability catalog" in param
     # The source definition is not mutated.
     assert "memory" in definition["function"]["parameters"]["properties"]["toolsets"]["description"]
+
+
+
+def _call_hook_on_worker_thread(agent_holder: Any, hook: Any, **kwargs: Any) -> None:
+    """Mimic current Hermes: the caller holds ``agent`` while a timeout worker runs the hook."""
+    import threading
+
+    agent = agent_holder  # noqa: F841 - must be a live local in this (caller) frame
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            hook(**kwargs)
+        except BaseException as exc:  # noqa: BLE001 - surfaced below
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert not errors, errors
+
+
+def test_pre_llm_call_on_worker_thread_finds_agent_by_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry,
+        "worker-thread-route",
+        names=("web_search", "read_file", "run_command"),
+        enabled=("web", "file", "terminal"),
+    )
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    router._drop_agent_ref(agent.session_id)
+    _call_hook_on_worker_thread(
+        agent,
+        router.pre_llm_call,
+        session_id=agent.session_id,
+        turn_id="worker-1",
+        user_message="search the web for news",
+    )
+    assert _rev6_names(agent) == ["web_search", "request_toolset"]
+
+
+def test_worker_thread_lookup_never_binds_another_sessions_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    other = _rev6_agent(
+        registry,
+        "worker-thread-other",
+        names=("web_search", "read_file", "run_command"),
+        enabled=("web", "file", "terminal"),
+    )
+    before = list(other.tools)
+    router._drop_agent_ref("worker-thread-unknown")
+    router._drop_agent_ref(other.session_id)
+    _call_hook_on_worker_thread(
+        other,
+        router.pre_llm_call,
+        session_id="worker-thread-unknown",
+        turn_id="worker-2",
+        user_message="search the web for news",
+    )
+    assert other.tools == before

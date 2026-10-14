@@ -52,6 +52,7 @@ try:
         RouterState,
         _drop_agent_ref,
         _get_agent_from_stack,
+        _find_agent_in_threads,
         _get_agent_ref,
         _get_router_state,
         _store_agent_ref,
@@ -121,6 +122,7 @@ except ImportError:  # pragma: no cover - direct loader fallback
         RouterState,
         _drop_agent_ref,
         _get_agent_from_stack,
+        _find_agent_in_threads,
         _get_agent_ref,
         _get_router_state,
         _store_agent_ref,
@@ -956,8 +958,14 @@ def _route_tool_surface(
     """Capture admission before empty-message exits, then route one surface."""
     cfg = _load_config()
     if agent is None:
-        agent = _get_agent_from_stack() or _get_agent_ref(
-            str(kwargs.get("session_id") or "") or None
+        # Same order as before for inline hooks (own stack, then the stored
+        # session ref); current Hermes runs pre_llm_call on a timeout worker
+        # thread, so finally search the other threads by exact session id.
+        hook_session_id = str(kwargs.get("session_id") or "") or None
+        agent = (
+            _get_agent_from_stack()
+            or _get_agent_ref(hook_session_id)
+            or (_find_agent_in_threads(hook_session_id) if hook_session_id else None)
         )
     session_id = str(kwargs.get("session_id") or getattr(agent, "session_id", "") or "")
     if agent is not None:
@@ -1146,7 +1154,11 @@ def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
     requested_tool = str(args.get("tool_name") or "").strip()
     reason = str(args.get("reason") or "").strip()[:200]
     session_id = str(kwargs.get("session_id") or "")
-    agent = _get_agent_ref(session_id) or kwargs.get("agent") or _get_agent_from_stack()
+    agent = (
+        _get_agent_ref(session_id)
+        or kwargs.get("agent")
+        or _get_agent_from_stack(str(session_id) if session_id else None)
+    )
     admission: EnsureAdmissionResult | None = None
     if agent is not None:
         session_id = session_id or str(getattr(agent, "session_id", "") or "")
@@ -1272,7 +1284,11 @@ def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
 def tool_request_middleware(**kwargs: Any) -> Optional[Dict[str, Any]]:
     """Admit a missing exact tool before normal Hermes dispatch validation."""
     session_id = str(kwargs.get("session_id") or "")
-    agent = _get_agent_ref(session_id) or kwargs.get("agent") or _get_agent_from_stack()
+    agent = (
+        _get_agent_ref(session_id)
+        or kwargs.get("agent")
+        or _get_agent_from_stack(str(session_id) if session_id else None)
+    )
     tool_name = str(kwargs.get("tool_name") or "").strip()
     args = kwargs.get("args")
     if agent is None or not tool_name or not isinstance(args, dict):
@@ -1327,7 +1343,11 @@ def _owner_for_name_handler(name: str, registry: Any) -> str | None:
 def post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
     """Retry only after a guarded exact installation succeeded."""
     session_id = str(kwargs.get("session_id") or "")
-    agent = _get_agent_ref(session_id) or kwargs.get("agent") or _get_agent_from_stack()
+    agent = (
+        _get_agent_ref(session_id)
+        or kwargs.get("agent")
+        or _get_agent_from_stack(str(session_id) if session_id else None)
+    )
     tool_name = str(kwargs.get("tool_name") or "").strip()
     if agent is None or not tool_name:
         return None

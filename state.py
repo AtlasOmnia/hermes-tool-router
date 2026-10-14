@@ -31,13 +31,18 @@ logger = logging.getLogger(__name__)
 _agent_ref: Any = None
 _agent_refs: Dict[str, Any] = {}
 
-def _get_agent_from_stack() -> Any:
-    """Walk the call stack to find the agent object.
-    
-    The pre_llm_call hook is invoked from build_turn_context() in agent/turn_context.py,
-    which receives 'agent' as its first parameter. We walk up the stack frames to find it.
-    
-    This avoids any core Hermes modifications — pure Python introspection, update-safe.
+def _get_agent_from_stack(session_id: str | None = None) -> Any:
+    """Find the live agent object for a hook call.
+
+    First walks this thread's call stack (hooks invoked inline from
+    ``build_turn_context()``).  Current Hermes runs timeout-bounded hooks such
+    as ``pre_llm_call`` and ``post_tool_call`` on a worker thread, where the
+    agent is not on the stack; when ``session_id`` is known, the frames of the
+    other live threads are then searched for an agent whose ``session_id``
+    matches exactly.  The session match keeps concurrent gateway sessions from
+    ever binding another session's agent.
+
+    Pure Python introspection; no Hermes core modification.
     """
     import sys
     frame = sys._getframe()
@@ -45,11 +50,57 @@ def _get_agent_from_stack() -> Any:
         # Walk up the stack looking for a frame with an 'agent' local
         while frame is not None:
             agent = frame.f_locals.get("agent")
-            if agent is not None and hasattr(agent, "tools"):
+            if (
+                agent is not None
+                and hasattr(agent, "tools")
+                and (not session_id or _agent_session_matches(agent, session_id))
+            ):
                 return agent
             frame = frame.f_back
     finally:
         del frame  # prevent reference cycles
+    if session_id:
+        return _find_agent_in_threads(session_id)
+    return None
+
+
+def _agent_session_matches(agent: Any, session_id: str) -> bool:
+    try:
+        return str(getattr(agent, "session_id", "") or "") == str(session_id)
+    except Exception:  # noqa: BLE001 - foreign objects; never let lookup raise
+        return False
+
+
+def _find_agent_in_threads(session_id: str) -> Any:
+    """Return the agent with this exact session_id from any live thread's frames."""
+    import sys
+    import threading
+
+    own = threading.get_ident()
+    try:
+        frames = sys._current_frames()
+    except Exception:  # noqa: BLE001 - introspection unavailable: no agent
+        return None
+    try:
+        for thread_id, frame in frames.items():
+            if thread_id == own:
+                continue
+            while frame is not None:
+                try:
+                    local_vars = frame.f_locals
+                except Exception:  # noqa: BLE001 - frame vanished mid-walk
+                    break
+                for name in ("agent", "self"):
+                    candidate = local_vars.get(name)
+                    if (
+                        candidate is not None
+                        and hasattr(candidate, "tools")
+                        and _agent_session_matches(candidate, session_id)
+                    ):
+                        return candidate
+                frame = frame.f_back
+    finally:
+        del frames
     return None
 
 class RouterState:
