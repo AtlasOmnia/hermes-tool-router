@@ -20,3 +20,11 @@ def test_compatibility_modes_are_explicit():
     assert detect_compatibility({"pre_turn_context_build"}) is CompatibilityMode.REDUCED_SAFETY
     assert detect_compatibility({"pre_llm_call"}) is CompatibilityMode.LATE_COMPATIBILITY
     assert detect_compatibility(set()) is CompatibilityMode.UNSUPPORTED_FOR_TOKEN_SAVINGS
+
+
+def test_tool_request_middleware_counts_as_recovery():
+    assert (
+        detect_compatibility({"pre_turn_context_build"}, {"tool_request"})
+        is CompatibilityMode.PRODUCTION
+    )
+    assert detect_compatibility({"pre_turn_context_build"}, set()) is CompatibilityMode.REDUCED_SAFETY

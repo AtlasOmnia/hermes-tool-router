@@ -13,10 +13,12 @@ class CompatibilityMode(str, Enum):
     UNSUPPORTED_FOR_TOKEN_SAVINGS = "unsupported_for_token_savings"
 
 
-def detect_compatibility(hooks: Iterable[str]) -> CompatibilityMode:
+def detect_compatibility(hooks: Iterable[str], middleware: Iterable[str] = ()) -> CompatibilityMode:
     available = set(hooks)
     early = "pre_tool_surface_build" in available or "pre_turn_context_build" in available
-    recovery = "on_unavailable_tool_call" in available
+    # Recovery is the legacy hook or Hermes's tool_request middleware (the
+    # mechanism this plugin actually registers).
+    recovery = "on_unavailable_tool_call" in available or "tool_request" in set(middleware)
     if early and recovery:
         return CompatibilityMode.PRODUCTION
     if early:

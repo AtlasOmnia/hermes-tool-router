@@ -158,6 +158,16 @@ class RouterState:
         self.denied_toolsets: Set[str] = set()
         self.denied_tool_names: Set[str] = set()
         self.last_expansion_result: Any = None
+        # (session_id, admission) of an ended session whose surface could not
+        # be restored; quarantines a reused agent until a restore succeeds.
+        self._retired_admission: Any = None
+        self._retry_turn_id: str | None = None
+        # Bumped by every committed surface change; a candidate prepared
+        # against an older revision is recomputed instead of overwriting a
+        # newer surface (lost update).  Never reset.
+        self.surface_revision: int = 0
+        # Exact (tools, enabled_toolsets) this router last committed.
+        self.committed_surface: Any = None
         # Capability lifecycle is intentionally attached to this RouterState.
         self._admission_session_id: Optional[str] = None
         self._bound_admission_result: Optional[EnsureAdmissionResult] = None
@@ -344,6 +354,8 @@ class RouterState:
         self.denied_toolsets = set()
         self.denied_tool_names = set()
         self.last_expansion_result = None
+        self._retired_admission = None
+        self._retry_turn_id = None
 
     def capability_snapshot(self) -> dict[str, Any]:
         """Return a shallow snapshot of coordinated router fields."""

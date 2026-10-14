@@ -21,7 +21,7 @@ def build_report(
 ) -> dict:
     hook_set = set(hooks)
     middleware_set = set(middleware)
-    mode = detect_compatibility(hook_set)
+    mode = detect_compatibility(hook_set, middleware_set)
     early = mode in {CompatibilityMode.PRODUCTION, CompatibilityMode.REDUCED_SAFETY}
     routes_before_request = early or mode is CompatibilityMode.LATE_COMPATIBILITY
     return {
