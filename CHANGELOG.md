@@ -44,8 +44,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 - Disabling after narrowing restores the captured surface once and drops tools added while narrowed; re-enabling in the same session does not narrow again. The guard lets connector (`connectors__*`) and unregistered names through.
 
-Review history: dev-critic2 rounds 1-9 on the capability-catalog / compatibility work; round 9 verdict ship (medium confidence).
-
 ## [0.2.0rc1] - 2026-08-06
 
 ### Added

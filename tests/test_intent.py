@@ -902,7 +902,7 @@ def test_task_prompts_keep_their_pre_change_routes():
         "List your tools and capture the screen": {"computer_use"},
         "What tools can you use and execute pytest": {"terminal"},
         "Show your capabilities and delegate this to a subagent": {"delegation"},
-        "List your tools and remember my name is Jonathan": {"memory"},
+        "List your tools and remember my name is Sam": {"memory"},
         "Search the web for which tools support SQLite.": {"web"},
         "What tools can you use? Then run pytest.": {"terminal"},
         "Which integrations launched today? Search the web.": {"web"},
