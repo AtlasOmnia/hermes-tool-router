@@ -2996,3 +2996,163 @@ def test_restore_returns_exact_enabled_toolsets_with_bridge(monkeypatch: pytest.
     assert router.restore_admitted_envelope(agent, admission) is True
     assert list(agent.tools) == original_tools
     assert list(agent.enabled_toolsets) == list(enabled)
+
+
+
+# --- Review round 3 regressions ------------------------------------------
+
+
+def test_disabled_router_on_worker_thread_never_touches_the_surface(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry, enabled=False)
+    agent = _rev6_agent(
+        registry,
+        "disabled-worker",
+        names=("web_search", "read_file"),
+        enabled=("web", "file", "cronjob"),
+    )
+    router._drop_agent_ref(agent.session_id)
+    _call_hook_on_worker_thread(
+        agent, router.pre_llm_call,
+        session_id=agent.session_id, turn_id="d-1", user_message="hello",
+    )
+    assert list(agent.enabled_toolsets) == ["web", "file", "cronjob"]
+    late = {"type": "function", "function": {"name": "late_mcp_tool", "description": "late"}}
+    agent.tools = list(agent.tools) + [late]
+    agent.valid_tool_names = set(agent.valid_tool_names) | {"late_mcp_tool"}
+    agent.enabled_toolsets = list(agent.enabled_toolsets) + ["late_mcp"]
+    _call_hook_on_worker_thread(
+        agent, router.pre_llm_call,
+        session_id=agent.session_id, turn_id="d-2", user_message="hello again",
+    )
+    assert "late_mcp_tool" in _rev6_names(agent)
+    assert "late_mcp_tool" in agent.valid_tool_names
+    assert "late_mcp" in agent.enabled_toolsets
+
+
+def test_disabling_after_narrowing_restores_once_then_stays_hands_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    config = {
+        "enabled": True, "long_message_decline_chars": 10_000, "short_message_bypass_chars": 0,
+        "floor_toolsets": [], "deterministic_rules_enabled": True, "confidence_threshold": 0.0,
+        "router_hard_timeout_ms": 1_200, "classifier": {"enabled": False},
+    }
+    monkeypatch.setattr(router, "_load_config", lambda: {"global": config})
+    monkeypatch.setattr(router, "_get_profile_config", lambda *a, **k: config)
+    monkeypatch.setattr(router, "_get_available_toolsets", lambda: set(registry.toolsets))
+    agent = _rev6_agent(registry, "disable-after-narrow", names=("web_search", "read_file"), enabled=("web", "file"))
+    original = list(agent.tools)
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    _route(agent, "n-1", "search the web for news")
+    assert "read_file" not in _rev6_names(agent)
+    config["enabled"] = False
+    _route(agent, "n-2", "next")
+    assert list(agent.tools) == original
+    late = {"type": "function", "function": {"name": "late_mcp_tool", "description": "late"}}
+    agent.tools = list(agent.tools) + [late]
+    _route(agent, "n-3", "and again")
+    assert "late_mcp_tool" in _rev6_names(agent)
+
+
+def test_route_rejects_stack_agent_with_a_different_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(registry, "actual-session", names=("web_search", "read_file"), enabled=("web", "file"))
+    before = list(agent.tools)
+    router._drop_agent_ref("different-hook-session")
+    router.pre_llm_call(session_id="different-hook-session", turn_id="x", user_message="search the web")
+    assert agent.tools == before
+    assert router._get_agent_ref("different-hook-session") is not agent
+
+
+def test_thread_scan_rejects_duplicate_session_ids_and_survives_hostile_objects() -> None:
+    import threading
+
+    state_mod = sys.modules["hermes_token_router_plugin.state"]
+
+    class Hostile:
+        session_id = "dup-session"
+
+        @property
+        def tools(self):  # pragma: no cover - must never be reached first
+            raise RuntimeError("hostile property")
+
+    def holder(obj: Any, ready: threading.Event, release: threading.Event) -> None:
+        agent = obj  # noqa: F841 - live local for the scan
+        ready.set()
+        release.wait(5)
+
+    def hostile_holder(ready: threading.Event, release: threading.Event) -> None:
+        self = Hostile()  # noqa: F841 - live 'self' local
+        ready.set()
+        release.wait(5)
+
+    first = SimpleNamespace(session_id="dup-session", tools=[], valid_tool_names=set(), enabled_toolsets=[])
+    second = SimpleNamespace(session_id="dup-session", tools=[], valid_tool_names=set(), enabled_toolsets=[])
+    release = threading.Event()
+    events = [threading.Event() for _ in range(3)]
+    threads = [
+        threading.Thread(target=holder, args=(first, events[0], release)),
+        threading.Thread(target=holder, args=(second, events[1], release)),
+        threading.Thread(target=hostile_holder, args=(events[2], release)),
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        for event in events:
+            assert event.wait(5)
+        assert state_mod._find_agent_in_threads("dup-session") is None
+        assert state_mod._find_agent_in_threads("no-such-session") is None
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(5)
+
+
+def test_explicit_agent_beats_a_stale_cached_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    stale = _rev6_agent(registry, "explicit-wins", names=("web_search",), enabled=("web",))
+    fresh = _rev6_agent(registry, "explicit-wins", names=("web_search",), enabled=("web",))
+    router._store_agent_ref(stale, "explicit-wins")
+    assert router._resolve_hook_agent(fresh, "explicit-wins") is fresh
+
+
+def test_protected_deferred_sibling_is_blocked_behind_the_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry,
+        "protected-bridge",
+        names=("web_search", "kanban_show", "tool_search", "tool_describe", "tool_call"),
+        enabled=("web", "kanban"),
+    )
+    metadata = {"schema_version": 1, "protected_toolsets": ["kanban"], "pinned_tool_names": ["kanban_show"]}
+    assert _rev6_admit(agent, monkeypatch, hook_metadata=metadata, owned=False).status == "READY"
+    _route(agent, "pb-1", "What can you do?")
+    assert "kanban" in agent.enabled_toolsets and "tool_call" in _rev6_names(agent)
+    blocked = router.pre_tool_call(tool_name="kanban_sibling", session_id=agent.session_id, args={})
+    assert isinstance(blocked, dict) and blocked["action"] == "block"
+    # Visible/captured tools and ordinary deferred tools are untouched.
+    assert router.pre_tool_call(tool_name="kanban_show", session_id=agent.session_id, args={}) is None
+    assert router.pre_tool_call(tool_name="memory_search", session_id=agent.session_id, args={}) is None
+
+
+def test_restore_assigns_the_exact_captured_enabled_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    for names, enabled in (
+        (("web_search", "tool_search", "tool_describe", "tool_call"), ("cronjob",)),
+        (("web_search", "read_file"), ("web", "file", "cronjob")),
+    ):
+        agent = _rev6_agent(registry, f"exact-{len(names)}", names=names, enabled=enabled)
+        admission = _rev6_admit(agent, monkeypatch, owned=False)
+        assert admission.status == "READY"
+        assert router.restore_admitted_envelope(agent, admission) is True
+        assert list(agent.enabled_toolsets) == list(enabled)

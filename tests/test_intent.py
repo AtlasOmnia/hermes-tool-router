@@ -115,8 +115,17 @@ def test_requests_and_local_questions_are_not_capability_inquiries():
 def test_task_prompts_keep_their_pre_change_routes():
     from hermes_tool_router_intent_test.policy import _predict_toolsets_by_rules
 
-    available = {"web", "file", "terminal", "browser", "vision", "memory", "skills"}
+    available = {
+        "web", "file", "terminal", "browser", "vision", "memory", "skills",
+        "cronjob", "computer_use", "delegation",
+    }
     expectations = {
+        # Review round 3: compound inventory + task requests.
+        "List your tools and schedule a reminder for tomorrow": {"cronjob"},
+        "List your tools and capture the screen": {"computer_use"},
+        "What tools can you use and execute pytest": {"terminal"},
+        "Show your capabilities and delegate this to a subagent": {"delegation"},
+        "List your tools and remember my name is Jonathan": {"memory"},
         "Search the web for which tools support SQLite.": {"web"},
         "What tools can you use? Then run pytest.": {"terminal"},
         "Which integrations launched today? Search the web.": {"web"},

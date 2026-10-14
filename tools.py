@@ -730,6 +730,8 @@ def _commit_candidate(
     predicted_toolsets: set[str] | None = None,
     initial: bool = False,
     retained_toolsets: tuple[str, ...] = (),
+    exact_enabled_toolsets: tuple[str, ...] | None = None,
+    surface_narrowed: bool | None = None,
 ) -> None:
     """Apply all coordinated fields, allowing the caller to roll back.
 
@@ -753,6 +755,9 @@ def _commit_candidate(
         or (toolset == RECOVERY_TOOLSET and RECOVERY_TOOL_NAME in names)
     ]
     enabled.extend(sorted(represented - set(enabled)))
+    if exact_enabled_toolsets is not None:
+        # Exact restore: the captured list as-is, no owner reconstruction.
+        enabled = list(exact_enabled_toolsets)
     state_snapshot = state.capability_snapshot()
     agent_snapshot = _copy_agent_fields(agent)
     try:
@@ -778,6 +783,8 @@ def _commit_candidate(
                 state.expansion_count += 1
             state.active_toolsets = new_active
         state.last_expansion_result = None
+        if surface_narrowed is not None:
+            state.surface_narrowed = surface_narrowed
     except Exception:
         _restore_agent_fields(agent, agent_snapshot)
         state.restore_capability_snapshot(state_snapshot)
@@ -883,7 +890,8 @@ def select_and_commit_route(
                     denied_tool_names=(),
                     predicted_toolsets=set(),
                     initial=True,
-                    retained_toolsets=tuple(envelope.original_enabled_toolsets or ()),
+                    exact_enabled_toolsets=tuple(envelope.original_enabled_toolsets or ()),
+                    surface_narrowed=False,
                 )
             except Exception as exc:
                 return _failure_result(
@@ -1042,6 +1050,7 @@ def select_and_commit_route(
             predicted_toolsets=set(predicted_toolsets),
             initial=True,
             retained_toolsets=_bridge_only_toolsets(envelope, protected_toolsets),
+            surface_narrowed=True,
         )
     except Exception as exc:
         return _failure_result(
@@ -1334,8 +1343,8 @@ def restore_admitted_envelope(
             denied_tool_names=(),
             predicted_toolsets=set(),
             initial=True,
-            # Exact restore: bridge-only toolsets come back with the envelope.
-            retained_toolsets=tuple(envelope.original_enabled_toolsets or ()),
+            exact_enabled_toolsets=tuple(envelope.original_enabled_toolsets or ()),
+            surface_narrowed=False,
         )
     except Exception:
         return False

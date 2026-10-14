@@ -62,6 +62,15 @@ _CAPABILITY_INQUIRY = re.compile(
     re.IGNORECASE,
 )
 _CAPABILITY_INQUIRY_MAX_CHARS = 160
+_INVENTORY_FILLER = frozenset(
+    [
+        "a", "access", "all", "an", "any", "are", "available", "can", "could", "currently",
+        "do", "does", "enabled", "for", "got", "have", "has", "help", "here", "hey", "hi",
+        "i", "in", "is", "just", "loaded", "me", "now", "of", "ok", "okay", "please",
+        "right", "session", "so", "the", "there", "these", "this", "to", "today", "use",
+        "using", "what", "which", "with", "you", "your", "yours", "exactly"
+    ]
+)
 _ASSISTANT_DIRECTED = re.compile(
     r"\b(?:you|your|yourself)\b"
     r"|\b(?:tools?|toolsets?)\s+(?:are\s+)?(?:loaded|available|enabled)"
@@ -96,7 +105,16 @@ def _is_capability_inquiry(text: str) -> bool:
     sentences = [part for part in re.split(r"[.?!;\n]+", text) if part.strip()]
     if len(sentences) != 1 or re.search(r"\b(?:then|and\s+then|also)\b", text, re.IGNORECASE):
         return False
-    return bool(_ASSISTANT_DIRECTED.search(text) and _CAPABILITY_INQUIRY.search(text))
+    match = _CAPABILITY_INQUIRY.search(text)
+    if not match or not _ASSISTANT_DIRECTED.search(text):
+        return False
+    # The whole message must be an inventory question: whatever is left
+    # outside the matched phrase may only be filler ("do you have", "right
+    # now", "please").  "List your tools and schedule a reminder" leaves
+    # "schedule", "reminder" -> not an inventory question.
+    remainder = (text[: match.start()] + " " + text[match.end():]).lower()
+    leftover = [word for word in re.findall(r"[a-z']+", remainder) if word not in _INVENTORY_FILLER]
+    return not leftover
 
 
 def classify_intent(message: str) -> IntentResult:

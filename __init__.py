@@ -53,6 +53,7 @@ try:
         _drop_agent_ref,
         _get_agent_from_stack,
         _find_agent_in_threads,
+        _get_validated_agent_ref,
         _get_agent_ref,
         _get_router_state,
         _store_agent_ref,
@@ -123,6 +124,7 @@ except ImportError:  # pragma: no cover - direct loader fallback
         _drop_agent_ref,
         _get_agent_from_stack,
         _find_agent_in_threads,
+        _get_validated_agent_ref,
         _get_agent_ref,
         _get_router_state,
         _store_agent_ref,
@@ -570,6 +572,7 @@ def register(ctx) -> None:
 
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("post_tool_call", post_tool_call)
+    ctx.register_hook("pre_tool_call", pre_tool_call)
     ctx.register_hook("on_session_end", on_session_end)
     try:
         ctx.register_middleware("tool_request", tool_request_middleware)
@@ -961,12 +964,16 @@ def _route_tool_surface(
         # Same order as before for inline hooks (own stack, then the stored
         # session ref); current Hermes runs pre_llm_call on a timeout worker
         # thread, so finally search the other threads by exact session id.
+        # Every candidate must carry the hook's exact session id.
         hook_session_id = str(kwargs.get("session_id") or "") or None
-        agent = (
-            _get_agent_from_stack()
-            or _get_agent_ref(hook_session_id)
-            or (_find_agent_in_threads(hook_session_id) if hook_session_id else None)
-        )
+        if hook_session_id:
+            agent = (
+                _get_agent_from_stack(hook_session_id, scan_threads=False)
+                or _get_validated_agent_ref(hook_session_id)
+                or _find_agent_in_threads(hook_session_id)
+            )
+        else:
+            agent = _get_agent_from_stack() or _get_agent_ref(None)
     session_id = str(kwargs.get("session_id") or getattr(agent, "session_id", "") or "")
     if agent is not None:
         _store_agent_ref(agent, session_id)
@@ -974,6 +981,22 @@ def _route_tool_surface(
         return None
 
     state = _get_router_state(agent)
+    if not _is_router_active(cfg) or not _get_profile_config(cfg).get("enabled", False):
+        # A disabled router must not touch a surface it never narrowed:
+        # no capture, no restore (hosts add tools mid-session).  If it did
+        # narrow earlier in this session, restore the exact envelope once.
+        if getattr(state, "surface_narrowed", False):
+            bound = state.bound_host_admission(session_id)
+            if (
+                bound is not None
+                and bound.status in {"READY", "SAFE_NO_PRUNE"}
+                and bound.envelope is not None
+            ):
+                restore_admitted_envelope(agent, bound)
+            state.surface_narrowed = False
+        state.active = False
+        state.predicted_toolsets = None
+        return None
     marker = state.no_authority_contamination(session_id)
     first_contact = not state.initial_route_applied and marker is None
     hook_metadata = kwargs.get("hermes_token_router_admission", MISSING)
@@ -1139,6 +1162,75 @@ def _call_admission_for_current(
     )
 
 
+def pre_tool_call(**kwargs: Any) -> dict[str, Any] | None:
+    """Keep protected capability inside the envelope behind Hermes tool search.
+
+    Hermes unwraps ``tool_call`` before this hook, so ``tool_name`` is the
+    real deferred tool.  The bridge authorizes any deferrable tool whose
+    toolset is enabled; a protected toolset can stay enabled because some of
+    its tools were captured (and are visible), which would expose uncaptured
+    siblings.  While this router has the surface narrowed, block a tool that
+    is not visible, not a captured definition, and owned by a protected
+    toolset.  Everything else proceeds untouched.
+    """
+    tool_name = str(kwargs.get("tool_name") or "")
+    session_id = str(kwargs.get("session_id") or "")
+    if not tool_name or not session_id:
+        return None
+    try:
+        agent = _resolve_hook_agent(kwargs.get("agent"), session_id)
+        if agent is None:
+            return None
+        state = _get_router_state(agent)
+        if not getattr(state, "surface_narrowed", False):
+            return None
+        if tool_name in set(getattr(agent, "valid_tool_names", ()) or ()):
+            return None
+        admission = state.bound_host_admission(session_id)
+        if admission is None or admission.envelope is None or admission.effective_policy is None:
+            return None
+        protected = admission.effective_policy.protected_toolsets
+        if not protected:
+            return None
+        if any(item.name == tool_name for item in admission.envelope.definitions):
+            return None
+        from tools.registry import registry
+        entry = registry.get_entry(tool_name)
+        owner = getattr(entry, "toolset", None) if entry is not None else None
+    except Exception as exc:  # noqa: BLE001 - never break unrelated tool calls
+        logger.debug("%s: pre_tool_call guard skipped: %s", PLUGIN_NAME, exc)
+        return None
+    if owner in protected:
+        return {
+            "action": "block",
+            "message": (
+                f"'{tool_name}' belongs to the protected toolset '{owner}' and was not "
+                "admitted for this session."
+            ),
+        }
+    return None
+
+
+def _resolve_hook_agent(explicit: Any, session_id: Any) -> Any:
+    """Explicit agent first, then validated stored ref, then stack/threads.
+
+    Every candidate must carry the call's session id when one is given.
+    """
+    sid = str(session_id or "")
+    if explicit is not None and (not sid or _agent_session_matches_id(explicit, sid)):
+        return explicit
+    if sid:
+        return _get_validated_agent_ref(sid) or _get_agent_from_stack(sid)
+    return _get_agent_ref(None) or _get_agent_from_stack()
+
+
+def _agent_session_matches_id(agent: Any, session_id: str) -> bool:
+    try:
+        return str(getattr(agent, "session_id", "") or "") == session_id
+    except Exception:  # noqa: BLE001 - foreign objects
+        return False
+
+
 def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
     """Return a truthful result for one guarded expansion request."""
     args = args if isinstance(args, dict) else {}
@@ -1154,11 +1246,7 @@ def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
     requested_tool = str(args.get("tool_name") or "").strip()
     reason = str(args.get("reason") or "").strip()[:200]
     session_id = str(kwargs.get("session_id") or "")
-    agent = (
-        _get_agent_ref(session_id)
-        or kwargs.get("agent")
-        or _get_agent_from_stack(str(session_id) if session_id else None)
-    )
+    agent = _resolve_hook_agent(kwargs.get("agent"), session_id)
     admission: EnsureAdmissionResult | None = None
     if agent is not None:
         session_id = session_id or str(getattr(agent, "session_id", "") or "")
@@ -1284,11 +1372,7 @@ def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
 def tool_request_middleware(**kwargs: Any) -> Optional[Dict[str, Any]]:
     """Admit a missing exact tool before normal Hermes dispatch validation."""
     session_id = str(kwargs.get("session_id") or "")
-    agent = (
-        _get_agent_ref(session_id)
-        or kwargs.get("agent")
-        or _get_agent_from_stack(str(session_id) if session_id else None)
-    )
+    agent = _resolve_hook_agent(kwargs.get("agent"), session_id)
     tool_name = str(kwargs.get("tool_name") or "").strip()
     args = kwargs.get("args")
     if agent is None or not tool_name or not isinstance(args, dict):
@@ -1343,11 +1427,7 @@ def _owner_for_name_handler(name: str, registry: Any) -> str | None:
 def post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
     """Retry only after a guarded exact installation succeeded."""
     session_id = str(kwargs.get("session_id") or "")
-    agent = (
-        _get_agent_ref(session_id)
-        or kwargs.get("agent")
-        or _get_agent_from_stack(str(session_id) if session_id else None)
-    )
+    agent = _resolve_hook_agent(kwargs.get("agent"), session_id)
     tool_name = str(kwargs.get("tool_name") or "").strip()
     if agent is None or not tool_name:
         return None

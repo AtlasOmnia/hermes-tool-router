@@ -31,16 +31,15 @@ logger = logging.getLogger(__name__)
 _agent_ref: Any = None
 _agent_refs: Dict[str, Any] = {}
 
-def _get_agent_from_stack(session_id: str | None = None) -> Any:
+def _get_agent_from_stack(session_id: str | None = None, scan_threads: bool = True) -> Any:
     """Find the live agent object for a hook call.
 
     First walks this thread's call stack (hooks invoked inline from
-    ``build_turn_context()``).  Current Hermes runs timeout-bounded hooks such
-    as ``pre_llm_call`` and ``post_tool_call`` on a worker thread, where the
-    agent is not on the stack; when ``session_id`` is known, the frames of the
-    other live threads are then searched for an agent whose ``session_id``
-    matches exactly.  The session match keeps concurrent gateway sessions from
-    ever binding another session's agent.
+    ``build_turn_context()``).  When ``session_id`` is given, a stack candidate
+    must carry exactly that session id.  Current Hermes runs timeout-bounded
+    hooks such as ``pre_llm_call`` and ``post_tool_call`` on a worker thread,
+    where the agent is not on the stack; with ``scan_threads`` the frames of
+    the other live threads are then searched (see _find_agent_in_threads).
 
     Pure Python introspection; no Hermes core modification.
     """
@@ -50,16 +49,14 @@ def _get_agent_from_stack(session_id: str | None = None) -> Any:
         # Walk up the stack looking for a frame with an 'agent' local
         while frame is not None:
             agent = frame.f_locals.get("agent")
-            if (
-                agent is not None
-                and hasattr(agent, "tools")
-                and (not session_id or _agent_session_matches(agent, session_id))
+            if agent is not None and _looks_like_agent(agent) and (
+                not session_id or _agent_session_matches(agent, session_id)
             ):
                 return agent
             frame = frame.f_back
     finally:
         del frame  # prevent reference cycles
-    if session_id:
+    if session_id and scan_threads:
         return _find_agent_in_threads(session_id)
     return None
 
@@ -71,34 +68,54 @@ def _agent_session_matches(agent: Any, session_id: str) -> bool:
         return False
 
 
+def _looks_like_agent(candidate: Any) -> bool:
+    """The surface fields the router reads and writes must all be present."""
+    try:
+        return all(hasattr(candidate, name) for name in ("tools", "valid_tool_names", "enabled_toolsets"))
+    except Exception:  # noqa: BLE001 - foreign properties may raise anything
+        return False
+
+
 def _find_agent_in_threads(session_id: str) -> Any:
-    """Return the agent with this exact session_id from any live thread's frames."""
+    """Return the one agent with this exact session_id held by another live thread.
+
+    ``agent`` locals are searched before ``self`` locals.  The session id is
+    checked before any other attribute, every candidate inspection is
+    exception-contained, and two distinct matching objects are treated as
+    ambiguous (None) rather than guessed.
+    """
     import sys
     import threading
 
+    if not session_id:
+        return None
     own = threading.get_ident()
     try:
         frames = sys._current_frames()
     except Exception:  # noqa: BLE001 - introspection unavailable: no agent
         return None
     try:
-        for thread_id, frame in frames.items():
-            if thread_id == own:
-                continue
-            while frame is not None:
-                try:
-                    local_vars = frame.f_locals
-                except Exception:  # noqa: BLE001 - frame vanished mid-walk
-                    break
-                for name in ("agent", "self"):
-                    candidate = local_vars.get(name)
+        for local_name in ("agent", "self"):
+            matches: dict[int, Any] = {}
+            for thread_id, frame in frames.items():
+                if thread_id == own:
+                    continue
+                while frame is not None:
+                    try:
+                        candidate = frame.f_locals.get(local_name)
+                    except Exception:  # noqa: BLE001 - frame vanished mid-walk
+                        break
                     if (
                         candidate is not None
-                        and hasattr(candidate, "tools")
                         and _agent_session_matches(candidate, session_id)
+                        and _looks_like_agent(candidate)
                     ):
-                        return candidate
-                frame = frame.f_back
+                        matches[id(candidate)] = candidate
+                    frame = frame.f_back
+            if len(matches) == 1:
+                return next(iter(matches.values()))
+            if len(matches) > 1:
+                return None
     finally:
         del frames
     return None
@@ -119,6 +136,9 @@ class RouterState:
         self.routed_turn_id: Optional[str] = None
         self.routed_source: Optional[str] = None
         self.initial_route_applied: bool = False
+        # True only while this router has replaced the host surface with a
+        # narrowed one; a disabled router restores once, then stays hands-off.
+        self.surface_narrowed: bool = False
         self.initial_toolsets: Set[str] = set()
         self.active_toolsets: Set[str] = set()
         self.registry_generation: int = 0
@@ -330,6 +350,7 @@ class RouterState:
                 "routed_turn_id",
                 "routed_source",
                 "initial_route_applied",
+                "surface_narrowed",
                 "initial_toolsets",
                 "active_toolsets",
                 "registry_generation",
@@ -396,6 +417,14 @@ def _drop_agent_ref(session_id: str) -> None:
     removed = _agent_refs.pop(str(session_id), None)
     if removed is _agent_ref:
         _agent_ref = None
+
+
+def _get_validated_agent_ref(session_id: str) -> Any:
+    """Stored agent for this session, only if it still carries that session id."""
+    agent = _get_agent_ref(session_id) if session_id else None
+    if agent is not None and _agent_session_matches(agent, session_id):
+        return agent
+    return None
 
 
 def _get_agent_ref(session_id: Optional[str] = None) -> Any:

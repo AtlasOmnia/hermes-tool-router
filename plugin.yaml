@@ -8,6 +8,8 @@ requires_env: []
 provides_hooks:
   - pre_llm_call
   - post_tool_call
+  - pre_tool_call
+  - pre_turn_context_build
   - on_session_end
 provides_middleware:
   - tool_request
