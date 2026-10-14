@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import logging
+import re
+from collections.abc import Iterable, Mapping
 from typing import Any, Dict, List, Optional, Set
 
 try:
@@ -39,10 +42,123 @@ RECOVERY_TOOLSET = "router_recovery"
 RECOVERY_TOOLSET_CHOICES = sorted(TOOLSET_DESCRIPTIONS)
 
 
+# Bounds for the per-session capability catalog carried in request_toolset's
+# description.  Keep it compact and deterministic so the tool prefix stays
+# byte-stable (prompt-cache friendly) while the session stays narrowed.
+# Entries past CATALOG_MAX_DESCRIBED keep their exact names but drop the
+# one-line description, so the catalog never silently omits a toolset.
+CATALOG_MAX_DESCRIBED = 60
+CATALOG_MAX_DESCRIPTION_CHARS = 80
+CATALOG_MAX_PARTIAL_NAMES = 6
+# Any admitted owner identifier is listed verbatim, except ones that could
+# break the catalog's own punctuation or carry control characters.
+_CATALOG_NAME_RE = re.compile(r"^[^\s;(),\x00-\x1f\x7f]{1,64}$")
+
+RECOVERY_BASE_DESCRIPTION = "Load missing Hermes toolsets before continuing the task."
+
+
+def _catalog_name_ok(name: Any) -> bool:
+    return isinstance(name, str) and name != RECOVERY_TOOLSET and bool(_CATALOG_NAME_RE.match(name))
+
+
+def _catalog_toolset_names(toolsets: Iterable[Any]) -> list[str]:
+    return sorted({name for name in toolsets if _catalog_name_ok(name)})
+
+
+def build_capability_catalog_description(
+    admitted: Mapping[str, Iterable[str]] | Iterable[str],
+    registry_members: Mapping[str, Iterable[str]] | None = None,
+) -> str:
+    """Return the deterministic request_toolset description for one session.
+
+    ``admitted`` maps each toolset owning definitions in the host-admission
+    envelope to its admitted tool names (or is a plain iterable of toolset
+    names).  That is what the agent would have with the router off, so the
+    catalog never advertises a toolset outside that boundary.  When
+    ``registry_members`` shows only part of a toolset was admitted, the entry
+    names the admitted tools instead of the toolset's generic description, so
+    a read-only subset is not described as read/write.
+    """
+    if isinstance(admitted, Mapping):
+        admitted_map = {
+            name: sorted({tool for tool in tools if isinstance(tool, str) and tool})
+            for name, tools in admitted.items()
+            if _catalog_name_ok(name)
+        }
+    else:
+        admitted_map = {name: [] for name in _catalog_toolset_names(admitted)}
+    names = sorted(admitted_map)
+    if not names:
+        return RECOVERY_BASE_DESCRIPTION
+    members = registry_members or {}
+    entries = []
+    for name in names[:CATALOG_MAX_DESCRIBED]:
+        tools = admitted_map[name]
+        registry_tools = {tool for tool in members.get(name, ()) if isinstance(tool, str)}
+        if tools and registry_tools and not registry_tools <= set(tools):
+            listed = ", ".join(tools[:CATALOG_MAX_PARTIAL_NAMES])
+            if len(tools) > CATALOG_MAX_PARTIAL_NAMES:
+                listed += f", +{len(tools) - CATALOG_MAX_PARTIAL_NAMES} more"
+            desc = f"limited to: {listed}"
+        else:
+            desc = TOOLSET_DESCRIPTIONS.get(name, f"Tools for {name}")
+        desc = " ".join(str(desc).split())[:CATALOG_MAX_DESCRIPTION_CHARS]
+        entries.append(f"{name} ({desc})")
+    catalog = "; ".join(entries)
+    overflow = names[CATALOG_MAX_DESCRIBED:]
+    if overflow:
+        catalog += "; also: " + ", ".join(overflow)
+    return (
+        "Some of your tools are not loaded yet, to save context. "
+        "Capability catalog for this session (toolsets you can load with this tool; "
+        "some may already be loaded): " + catalog + ". "
+        "When the user asks what you can do or whether you can do something, "
+        "answer from this catalog: these capabilities are available on request, "
+        "though an account, credential, or approval may still be required. "
+        "Call this tool with the exact toolset names to load them before using them. "
+        "Never say a listed capability is unavailable without first loading it."
+    )
+
+
+def with_capability_catalog(
+    recovery_definition: dict[str, Any],
+    admitted: Mapping[str, Iterable[str]] | Iterable[str],
+    registry_members: Mapping[str, Iterable[str]] | None = None,
+) -> dict[str, Any]:
+    """Return an agent-local copy of the recovery definition with the catalog.
+
+    The registry's shared definition is never mutated.
+    """
+    definition = copy.deepcopy(recovery_definition)
+    function = definition.get("function")
+    if isinstance(function, dict):
+        function["description"] = build_capability_catalog_description(admitted, registry_members)
+        # Keep one list in the definition: the toolsets parameter names the
+        # session catalog rather than the whole registry.
+        toolsets_param = (
+            function.get("parameters", {}).get("properties", {}).get("toolsets")
+            if isinstance(function.get("parameters"), dict)
+            else None
+        )
+        if isinstance(toolsets_param, dict) and "description" in toolsets_param:
+            toolsets_param["description"] = (
+                "One or more exact toolset names from the capability catalog above."
+            )
+    return definition
+
+
+def _recovery_is_host_locked(owner: Any, protected_toolsets: Any, pins: Any) -> bool:
+    """True when the host protected or pinned the recovery control itself."""
+    return RECOVERY_TOOL_NAME in (pins or ()) or (owner is not None and owner in (protected_toolsets or ()))
+
+
 def build_recovery_tool_schema(available_toolsets: Set[str]) -> Dict[str, Any]:
     """Build the compact recovery schema from the live registry surface."""
+    names = _catalog_toolset_names(available_toolsets) or list(RECOVERY_TOOLSET_CHOICES)
+    shown = names[:CATALOG_MAX_DESCRIBED]
+    listed = ", ".join(shown) + (f", plus {len(names) - len(shown)} more" if len(names) > len(shown) else "")
     return {
-        "description": "Load missing Hermes toolsets before continuing the task.",
+        "description": RECOVERY_BASE_DESCRIPTION,
         "parameters": {
             "type": "object",
             "additionalProperties": False,
@@ -53,10 +169,8 @@ def build_recovery_tool_schema(available_toolsets: Set[str]) -> Dict[str, Any]:
                     "minItems": 1,
                     "uniqueItems": True,
                     "description": (
-                        "One or more Hermes toolset names to add for this session, such as "
-                        "file, terminal, web, browser, computer_use, vision, image_gen, "
-                        "video, video_gen, memory, skills, session_search, cronjob, "
-                        "delegation, tts, or code_execution. Names are validated against "
+                        "One or more Hermes toolset names to add for this session. "
+                        f"Registered toolsets: {listed}. Names are validated against "
                         "the live registry when called."
                     ),
                 },
@@ -788,10 +902,29 @@ def select_and_commit_route(
             reason="PROTECTED_DENIED",
         )
 
+    # Toolsets owning definitions in the admitted envelope, with their
+    # admitted tool names: what this agent would see with the router off.
+    # This is the session capability catalog.
+    catalog_toolsets: dict[str, set[str]] = {}
+    for item in envelope.definitions:
+        if item.owner_toolset_at_capture and item.name != RECOVERY_TOOL_NAME:
+            catalog_toolsets.setdefault(item.owner_toolset_at_capture, set()).add(item.name)
+    catalog_members = {
+        toolset: _registry_tool_names(registry, toolset) for toolset in catalog_toolsets
+    }
+
     # A request_toolset supplied in the host surface stays in envelope order.
+    # It is this plugin's own control, so it carries the session catalog
+    # unless the host protected or pinned it (then it stays byte-exact).
     if RECOVERY_TOOL_NAME in definition_map:
-        selected[RECOVERY_TOOL_NAME] = thaw_json(definition_map[RECOVERY_TOOL_NAME].payload)
-        selected_owner[RECOVERY_TOOL_NAME] = definition_map[RECOVERY_TOOL_NAME].owner_toolset_at_capture
+        envelope_recovery = definition_map[RECOVERY_TOOL_NAME]
+        recovery_payload = thaw_json(envelope_recovery.payload)
+        if not _recovery_is_host_locked(envelope_recovery.owner_toolset_at_capture, protected_toolsets, pins):
+            recovery_payload = with_capability_catalog(
+                recovery_payload, catalog_toolsets, catalog_members
+            )
+        selected[RECOVERY_TOOL_NAME] = recovery_payload
+        selected_owner[RECOVERY_TOOL_NAME] = envelope_recovery.owner_toolset_at_capture
 
     for name, definition, owner in ordinary_candidates:
         selected.setdefault(name, definition)
@@ -811,6 +944,9 @@ def select_and_commit_route(
     if RECOVERY_TOOL_NAME not in selected:
         recovery = _get_recovery_tool_definition()
         if recovery is not None and _tool_name(recovery) == RECOVERY_TOOL_NAME:
+            # Agent-local copy carrying the session capability catalog.  Built
+            # once here and carried unchanged through later expansions.
+            recovery = with_capability_catalog(recovery, catalog_toolsets, catalog_members)
             selected[RECOVERY_TOOL_NAME] = recovery
             selected_owner[RECOVERY_TOOL_NAME] = RECOVERY_TOOLSET
 
@@ -986,7 +1122,21 @@ def expand_admitted_toolsets(
     # Never manufacture an item for a protected request.  Existing ordinary
     # definitions remain part of the candidate and are reported as installed.
     for name in current:
-        if name in definition_map:
+        if (
+            name == RECOVERY_TOOL_NAME
+            and name in definition_map
+            and not _recovery_is_host_locked(
+                definition_map[name].owner_toolset_at_capture, protected_toolsets, pinned_names
+            )
+        ):
+            # Keep the session's catalog-bearing copy byte-stable.
+            definition = next(
+                (item for item in (getattr(agent, "tools", None) or []) if _tool_name(item) == name),
+                None,
+            )
+            selected.setdefault(name, definition if definition is not None else thaw_json(definition_map[name].payload))
+            selected_owner.setdefault(name, owner_map.get(name))
+        elif name in definition_map:
             selected.setdefault(name, thaw_json(definition_map[name].payload))
             selected_owner.setdefault(name, owner_map.get(name))
         else:

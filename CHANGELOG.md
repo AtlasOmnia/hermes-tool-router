@@ -7,6 +7,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Fixed
 
+- The model can now say what it can do after first-turn narrowing: `request_toolset` carries a per-session capability catalog (admitted toolsets with one-line descriptions) instead of a generic one-line description, so capability questions no longer depend on the model first attempting a pruned tool. The `toolsets` parameter description is now generated from the registry, as documented.
+- Standalone capability questions ("what can you do?", "what tools do you have access to?") are classified as `capability_inquiry` and route to the small surface consistently; previously some wordings fell back to the full surface and others to answer-only. Messages that also carry a task keep their normal routing.
+- Partially admitted toolsets are listed with their admitted tool names rather than the toolset's generic description.
+
 - OpenRouter classifier requests now attribute `HTTP-Referer` to this repository (`AtlasOmnia/hermes-tool-router`) instead of the upstream `hermes-agent` org.
 - Classifier response parsing is consolidated onto one strict fail-open contract (`parse_classifier_payload`), shared with `classifier.parse_classifier_output`. Documented string/percent confidence tolerance ("95%", `"0.93"`) is retained; non-finite values (NaN/inf) now provably fail open.
 - Replaced a lambda assignment in the smoke test (ruff E731); lint is clean.

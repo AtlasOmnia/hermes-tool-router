@@ -1785,7 +1785,17 @@ def test_worker_answer_only_keeps_pins_and_recovery_control_in_fixed_order(
     assert _rev6_names(agent) == ["kanban_complete", "kanban_show", "request_toolset"]
     assert "kanban_sibling" not in _rev6_names(agent)
     assert _rev6_names(agent)[-1] == "request_toolset"
-    assert agent.tools[-1] == registry.definitions["request_toolset"]
+    # The recovery control is an agent-local copy of the registry definition
+    # carrying this session's capability catalog; the shared registry
+    # definition itself is unchanged.
+    recovery = agent.tools[-1]
+    shared = registry.definitions["request_toolset"]
+    assert recovery["function"]["name"] == shared["function"]["name"]
+    assert recovery["function"]["parameters"] == shared["function"]["parameters"]
+    assert shared["function"]["description"] == "captured-request_toolset"
+    catalog = recovery["function"]["description"]
+    assert "kanban (" in catalog and "web (" in catalog
+    assert "kanban_sibling" not in catalog
 
 def test_no_authority_append_contaminates_session_and_forbids_later_host_capture(
     monkeypatch: pytest.MonkeyPatch,
@@ -2673,3 +2683,191 @@ def test_incomplete_registration_preserves_admitted_surface_without_narrowing(
         assert state._bound_admission_result is admission
     finally:
         router.__dict__.update(flags)
+
+
+
+# --- Session capability catalog (request_toolset description) -------------
+
+
+def _recovery_description(agent: Any) -> str:
+    recovery = [item for item in agent.tools if item["function"]["name"] == "request_toolset"]
+    assert len(recovery) == 1
+    return recovery[0]["function"]["description"]
+
+
+def _route(agent: Any, turn_id: str, message: str) -> None:
+    router.pre_turn_context_build(
+        agent=agent,
+        session_id=agent.session_id,
+        turn_id=turn_id,
+        user_message=message,
+    )
+
+
+@pytest.mark.parametrize("host_supplies_recovery", [False, True])
+def test_capability_question_sees_admitted_catalog_and_stays_stable(
+    monkeypatch: pytest.MonkeyPatch,
+    host_supplies_recovery: bool,
+) -> None:
+    registry = _Rev6Registry()
+    shared_before = json.dumps(registry.definitions["request_toolset"], sort_keys=True)
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    names = ("web_search", "read_file", "run_command", "kanban_show")
+    if host_supplies_recovery:
+        names = names + ("request_toolset",)
+    agent = _rev6_agent(
+        registry,
+        f"catalog-{host_supplies_recovery}",
+        names=names,
+        enabled=("web", "file", "terminal", "kanban", "router_recovery"),
+    )
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+
+    _route(agent, "catalog-1", "What can you do?")
+    # Option A: capability questions keep the small surface ...
+    assert _rev6_names(agent) == ["request_toolset"]
+    catalog = _recovery_description(agent)
+    # ... and the catalog names every admitted toolset with a description.
+    for toolset in ("web", "file", "terminal", "kanban"):
+        assert f"{toolset} (" in catalog, toolset
+    # Registry toolsets outside the admitted envelope are never advertised.
+    for outside in ("memory (", "skills (", "router_recovery"):
+        assert outside not in catalog, outside
+    assert "what you can do" in catalog
+    # The shared registry definition is untouched.
+    assert json.dumps(registry.definitions["request_toolset"], sort_keys=True) == shared_before
+
+    # A later capability question in the sticky session still sees the same
+    # catalog, byte for byte.
+    _route(agent, "catalog-2", "Which tools do you have access to?")
+    assert _recovery_description(agent) == catalog
+
+    # Recovery expansion keeps the catalog byte-stable.
+    response = json.loads(
+        router.request_toolset_handler(
+            {"toolsets": ["file"]},
+            agent=agent,
+            session_id=agent.session_id,
+        )
+    )
+    assert response["ok"] is True
+    assert "read_file" in _rev6_names(agent)
+    assert _recovery_description(agent) == catalog
+    assert json.dumps(registry.definitions["request_toolset"], sort_keys=True) == shared_before
+
+
+def test_catalog_is_deterministic_across_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    descriptions = []
+    for index, names in enumerate((
+        ("web_search", "read_file", "kanban_show"),
+        ("kanban_show", "read_file", "web_search"),
+    )):
+        agent = _rev6_agent(registry, f"determinism-{index}", names=names, enabled=("web", "file", "kanban"))
+        assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+        _route(agent, f"determinism-{index}", "hello")
+        descriptions.append(_recovery_description(agent))
+    assert descriptions[0] == descriptions[1]
+    assert "Capability catalog for this session" in descriptions[0]
+
+
+def test_host_protected_recovery_control_stays_byte_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry,
+        "protected-recovery",
+        names=("web_search", "kanban_show", "request_toolset"),
+        enabled=("web", "kanban", "router_recovery"),
+    )
+    metadata = {
+        "schema_version": 1,
+        "protected_toolsets": ["kanban"],
+        "pinned_tool_names": ["request_toolset"],
+    }
+    assert _rev6_admit(agent, monkeypatch, hook_metadata=metadata, owned=False).status == "READY"
+    _route(agent, "protected-recovery", "What can you do?")
+    assert _recovery_description(agent) == "captured-request_toolset"
+
+
+
+def test_catalog_describes_partial_admission_by_tool_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry,
+        "partial-catalog",
+        names=("web_search", "kanban_show"),
+        enabled=("web", "kanban"),
+    )
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    _route(agent, "partial-catalog", "What can you do?")
+    catalog = _recovery_description(agent)
+    # Only kanban_show was admitted, so the generic "create, assign, move"
+    # description must not be used.
+    assert "kanban (limited to: kanban_show)" in catalog
+    assert "create, assign, move" not in catalog
+    # web was admitted in full, so it keeps its generic description.
+    assert "web (Search and extract content from web pages)" in catalog
+
+
+def test_catalog_lists_unusual_identifiers_and_never_drops_overflow() -> None:
+    tools_mod = sys.modules["hermes_token_router_plugin.tools"]
+    admitted = {"mcp/custom": ["custom_tool"], "_custom": ["other"], "SyntheticCustom": ["x"]}
+    catalog = tools_mod.build_capability_catalog_description(admitted)
+    for name in ("mcp/custom (", "_custom (", "SyntheticCustom ("):
+        assert name in catalog, name
+    assert "router_recovery" not in tools_mod.build_capability_catalog_description({"router_recovery": ["request_toolset"]})
+
+    many = {f"toolset_{index:03d}": [f"tool_{index}"] for index in range(tools_mod.CATALOG_MAX_DESCRIBED + 5)}
+    catalog = tools_mod.build_capability_catalog_description(many)
+    for name in many:
+        assert name in catalog, name
+    assert "; also: " in catalog
+
+
+def test_recovery_parameter_description_is_generated_from_registry() -> None:
+    tools_mod = sys.modules["hermes_token_router_plugin.tools"]
+    schema = tools_mod.build_recovery_tool_schema({"web", "synthetic_custom_toolset"})
+    description = schema["parameters"]["properties"]["toolsets"]["description"]
+    assert "synthetic_custom_toolset" in description
+    assert "video_gen" not in description
+
+
+
+def test_host_protected_recovery_owner_stays_byte_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry,
+        "protected-recovery-owner",
+        names=("web_search", "kanban_show", "request_toolset"),
+        enabled=("web", "kanban", "router_recovery"),
+    )
+    metadata = {
+        "schema_version": 1,
+        "protected_toolsets": ["router_recovery"],
+        "pinned_tool_names": [],
+    }
+    assert _rev6_admit(agent, monkeypatch, hook_metadata=metadata, owned=False).status == "READY"
+    _route(agent, "protected-recovery-owner", "What can you do?")
+    assert "request_toolset" in _rev6_names(agent)
+    assert _recovery_description(agent) == "captured-request_toolset"
+
+
+def test_catalog_copy_parameter_names_the_session_catalog() -> None:
+    tools_mod = sys.modules["hermes_token_router_plugin.tools"]
+    base = tools_mod.build_recovery_tool_schema({"web", "file", "memory"})
+    definition = {"type": "function", "function": {"name": "request_toolset", **base}}
+    decorated = tools_mod.with_capability_catalog(definition, {"web": ["web_search"]})
+    param = decorated["function"]["parameters"]["properties"]["toolsets"]["description"]
+    assert "memory" not in param
+    assert "capability catalog" in param
+    # The source definition is not mutated.
+    assert "memory" in definition["function"]["parameters"]["properties"]["toolsets"]["description"]

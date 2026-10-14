@@ -498,3 +498,9 @@
 {"acceptable_extra_toolsets": [], "critical": false, "id": "delegate-047", "prompt": "Delegate this to a subagent case 47", "required_toolsets": ["delegation"]}
 {"acceptable_extra_toolsets": [], "critical": false, "id": "delegate-048", "prompt": "Delegate this to a subagent case 48", "required_toolsets": ["delegation"]}
 {"acceptable_extra_toolsets": [], "critical": false, "id": "delegate-049", "prompt": "Delegate this to a subagent case 49", "required_toolsets": ["delegation"]}
+{"acceptable_extra_toolsets": [], "critical": false, "id": "capability-000", "prompt": "What can you do?", "required_toolsets": []}
+{"acceptable_extra_toolsets": [], "critical": false, "id": "capability-001", "prompt": "What are your capabilities?", "required_toolsets": []}
+{"acceptable_extra_toolsets": [], "critical": false, "id": "capability-002", "prompt": "What tools do you have access to?", "required_toolsets": []}
+{"acceptable_extra_toolsets": [], "critical": false, "id": "capability-003", "prompt": "Which tools are available to you?", "required_toolsets": []}
+{"acceptable_extra_toolsets": [], "critical": false, "id": "capability-004", "prompt": "List your tools", "required_toolsets": []}
+{"acceptable_extra_toolsets": [], "critical": false, "id": "capability-005", "prompt": "What integrations do you have?", "required_toolsets": []}

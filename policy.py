@@ -46,6 +46,11 @@ TOOLSET_DESCRIPTIONS: Dict[str, str] = {
     "telegram":         "Telegram bot integration",
     "delegation":       "Delegate tasks to subagents",
     "messaging":        "Send messages through configured gateway platforms",
+    "computer_use":     "Control the desktop — screenshots, mouse, keyboard",
+    "session_search":   "Search and recall past conversations",
+    "cronjob":          "Create and manage scheduled jobs and reminders",
+    "todo":             "Track a task list for multi-step work",
+    "clarify":          "Ask the user structured clarifying questions",
 }
 TOOLSET_INTENT_RULES: List[tuple[str, Set[str]]] = [
     (r"\b(reddit|subreddit|r/[A-Za-z0-9_]+)\b", {"web", "browser"}),
@@ -88,7 +93,7 @@ Rules:
 2. confidence must be a number from 0.0 to 1.0.
 3. Include ONLY toolsets directly relevant to the user's request.
 4. Do not include terminal, file, or web unless the request actually needs them.
-5. For ordinary questions that can be answered without tools, return an empty array.
+5. For ordinary questions that can be answered without tools, return an empty array. Questions about the assistant's own capabilities or available tools ("what can you do?", "what tools do you have?") also return an empty array; a capability catalog is provided to the assistant separately.
 6. If the message is ambiguous or uncertain, return "all" as the only toolset.
 7. Be conservative; only include toolsets you are confident are needed.
 8. Personal calendar, itinerary, reservation, or flight-detail lookups require "skills" and "terminal" when those toolsets are available.
@@ -218,6 +223,10 @@ def _predict_toolsets_by_rules(
         return None, "empty"
 
     intent_result = classify_intent(text)
+    if intent_result.intents == frozenset({Intent.CAPABILITY_INQUIRY}):
+        # Answered from the session capability catalog carried by
+        # request_toolset; no execution toolsets are needed up front.
+        return set(), f"intent:{intent_result.reason_code}"
     if intent_result.intents == frozenset({Intent.ANSWER_ONLY}):
         return set(), f"intent:{intent_result.reason_code}"
     if Intent.FULL_SURFACE not in intent_result.intents:
