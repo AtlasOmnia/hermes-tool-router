@@ -6,6 +6,8 @@ import contextlib
 import contextvars
 import copy
 import logging
+_LOG = logging.getLogger("hermes_plugins.hermes_token_router")
+_PLUGIN = "hermes-token-router"
 import re
 from collections.abc import Iterable, Mapping
 from typing import Any, Dict, Optional, Set
@@ -622,6 +624,14 @@ def _assign_candidate(
         raise
     state.surface_revision = getattr(state, "surface_revision", 0) + 1
     state.committed_surface = _surface_fingerprint(agent)
+    _LOG.info(
+        "%s: surface committed session=%s profile=%s initial=%s predicted=%s "
+        "tools=%d toolsets=%s",
+        _PLUGIN, getattr(agent, "session_id", "")[:24],
+        getattr(agent, "_profile_name", None) or getattr(agent, "agent_identity", "?"),
+        initial, sorted(predicted_toolsets) if predicted_toolsets is not None else None,
+        len(names), sorted(enabled),
+    )
 
 
 def _surface_fingerprint(agent: Any) -> Any:

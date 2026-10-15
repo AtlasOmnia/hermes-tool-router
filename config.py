@@ -25,11 +25,16 @@ def _load_config() -> dict:
     except Exception as exc:
         logger.warning("%s: failed to load config: %s", PLUGIN_NAME, exc)
     return {}
-def _get_profile_config(cfg: dict) -> dict:
+def _get_profile_config(cfg: dict, profile_name: str | None = None) -> dict:
     """Return the resolved config for the current Hermes profile.
 
     Merges: profile-specific settings → global defaults → built-in defaults.
     """
+    # Explicit agent-bound name wins: a multiplexed gateway's env holds the
+    # LAUNCH profile; turn-time callers pass the agent's own.
+    if profile_name:
+        return _get_profile_settings(cfg, profile_name)
+
     # Determine active profile from env (in priority order).
     explicit_profile = os.environ.get("HERMES_PROFILE") or \
                        os.environ.get("HERMES_ACTIVE_PROFILE")
@@ -113,6 +118,32 @@ def _get_classifier_connection(profile_cfg: dict) -> tuple[str, str]:
     )
 
 
+def _get_classifier_extra_body(profile_cfg: dict) -> dict:
+    """Extra body for the classifier chat.completions call.
+
+    Convenience: classifier.disable_thinking: true ->
+    {"chat_template_kwargs": {"enable_thinking": false}} (llama.cpp
+    reasoning-template models, e.g. MiniCPM5, which otherwise answer in
+    reasoning_content and leave content empty -> strict parser fails open).
+    classifier.extra_body (dict) is merged on top. Returns {} when unset.
+    """
+    classifier = profile_cfg.get("classifier", {})
+    if not isinstance(classifier, dict):
+        return {}
+    extra: dict = {}
+    if classifier.get("disable_thinking"):
+        kwargs = extra.setdefault("chat_template_kwargs", {})
+        kwargs["enable_thinking"] = False
+    configured = classifier.get("extra_body")
+    if isinstance(configured, dict):
+        for k, v in configured.items():
+            if k == "chat_template_kwargs" and isinstance(v, dict) and isinstance(extra.get(k), dict):
+                extra[k].update(v)
+            else:
+                extra[k] = v
+    return extra
+
+
 def _get_router_model(profile_cfg: dict) -> str:
     """Return the effective classifier model (v2 nested config, then legacy)."""
     classifier = profile_cfg.get("classifier", {})
@@ -129,7 +160,7 @@ def _get_router_provider(profile_cfg: dict) -> str:
     if not isinstance(router_provider, str) or not router_provider.strip():
         return DEFAULT_ROUTER_PROVIDER
     return router_provider.strip()
-def _is_router_active(cfg: dict = None) -> bool:
+def _is_router_active(cfg: dict = None, profile_name: str | None = None) -> bool:
     """Check if router is enabled for the current profile or process override."""
     override = os.environ.get("HERMES_TOKEN_ROUTER_ENABLED", "").strip().lower()
     if override in {"0", "false", "no", "off"}:
@@ -138,7 +169,7 @@ def _is_router_active(cfg: dict = None) -> bool:
         return True
     if cfg is None:
         cfg = _load_config()
-    profile_cfg = _get_profile_config(cfg)
+    profile_cfg = _get_profile_config(cfg, profile_name)
     enabled = profile_cfg.get("enabled", False)
     profile_name = profile_cfg.get("_profile_name", "unknown")
     logger.debug(

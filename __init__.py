@@ -24,6 +24,7 @@ try:
         PLUGIN_NAME,
         _get_profile_config,
         _get_classifier_connection,
+        _get_classifier_extra_body,
         _get_router_model,
         _get_router_provider,
         _is_classifier_enabled,
@@ -91,6 +92,7 @@ except ImportError:  # pragma: no cover - direct loader fallback
         PLUGIN_NAME,
         _get_profile_config,
         _get_classifier_connection,
+        _get_classifier_extra_body,
         _get_router_model,
         _get_router_provider,
         _is_classifier_enabled,
@@ -334,23 +336,40 @@ def _end_session_fenced(
 _RUNTIME_OVERRIDE: bool | None = None
 
 
-def _config_enabled(cfg: Any) -> bool:
-    return bool(_is_router_active(cfg) and _get_profile_config(cfg).get("enabled", False))
+def _profile_name_for(agent: Any = None) -> str | None:
+    """Owning profile of the AGENT, not of this process.
+
+    Under a multiplexed gateway the process env holds the launch profile
+    (default); the agent carries its own. Mirrors the host convention in
+    run_agent.py (`agent._profile_name` first).
+    """
+    if agent is None:
+        return None
+    for attr in ("_profile_name", "agent_identity"):
+        val = getattr(agent, attr, None)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
 
 
-def _router_enabled(cfg: Any) -> bool:
+def _config_enabled(cfg: Any, agent: Any = None) -> bool:
+    name = _profile_name_for(agent)
+    return bool(_is_router_active(cfg, name) and _get_profile_config(cfg, name).get("enabled", False))
+
+
+def _router_enabled(cfg: Any, agent: Any = None) -> bool:
     """Precedence: HERMES_TOKEN_ROUTER_ENABLED=off (kill switch) > /router > config."""
     if _env_override() is False:
         return False
     runtime = _RUNTIME_OVERRIDE
     if runtime is not None:
         return runtime
-    return _config_enabled(cfg)
+    return _config_enabled(cfg, agent)
 
 
-def _routing_settings(cfg: Any) -> dict[str, Any]:
+def _routing_settings(cfg: Any, agent: Any = None) -> dict[str, Any]:
     """Profile routing settings, independent of whether config enables routing."""
-    return _get_profile_settings(cfg)
+    return _get_profile_settings(cfg, _profile_name_for(agent))
 
 
 _ROUTER_HELP = (
@@ -500,6 +519,26 @@ def pre_llm_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
 _cfg = _load_config() if CONFIG_FILE.exists() else {}
 _prof_cfg = _get_profile_config(_cfg)
 logger.info("%s: plugin loaded profile=%s enabled=%s", PLUGIN_NAME, _prof_cfg.get("_profile_name"), _prof_cfg.get("enabled"))
+
+# Local patch: global.debug_logging: true in the plugin config raises THIS
+# logger to DEBUG (every bail-out reason logs) without touching host logging.
+try:
+    if isinstance(_cfg.get("global"), dict) and _cfg["global"].get("debug_logging"):
+        import logging as _logging
+        from pathlib import Path as _P
+        from logging.handlers import RotatingFileHandler as _RFH
+        logger.setLevel(_logging.DEBUG)
+        if not any(getattr(h, "_htr_debug", False) for h in logger.handlers):
+            _dbg_h = _RFH(_P(__file__).resolve().parent / "router-debug.log",
+                          maxBytes=2_000_000, backupCount=2, encoding="utf-8")
+            _dbg_h.setLevel(_logging.DEBUG)
+            _dbg_h.setFormatter(_logging.Formatter(
+                "%(asctime)s %(levelname)s [%(session_id)s] %(name)s: %(message)s",
+                defaults={"session_id": ""}))
+            _dbg_h._htr_debug = True
+            logger.addHandler(_dbg_h)
+except Exception:
+    pass
 
 def _read_worker_task_id() -> str:
     """Read the host worker signal at the adapter boundary only."""
@@ -789,6 +828,10 @@ def _route_tool_surface(
     if agent is not None:
         _store_agent_ref(agent, session_id)
     if agent is None or not session_id:
+        logger.debug(
+            "%s: %s source=%s session=%s (hook fired, no usable agent)",
+            PLUGIN_NAME, "AGENT_LOOKUP_FAILED" if agent is None else "NO_SESSION_ID",
+            source, session_id or "?")
         return None
 
     state = _get_router_state(agent)
@@ -810,7 +853,7 @@ def _route_fenced(
     kwargs: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Route body; every mutation below is checked against the hook's fence."""
-    if not _router_enabled(cfg):
+    if not _router_enabled(cfg, agent):
         # A disabled router must not touch a surface it never narrowed:
         # no capture, no restore (hosts add tools mid-session).  If it did
         # narrow earlier in this session, restore the exact envelope once.
@@ -907,7 +950,7 @@ def _route_fenced(
 
     # Enablement (config, environment, /router) was decided at the top of
     # this route; settings apply whether or not config.yaml enables routing.
-    profile_cfg = _routing_settings(cfg)
+    profile_cfg = _routing_settings(cfg, agent)
     if admission.status != "READY":
         # SAFE_NO_PRUNE restores only its already captured envelope.  All
         # other statuses preserve the current surface and deny additions.
@@ -965,6 +1008,7 @@ def _route_fenced(
                 _get_router_provider(profile_cfg),
                 max(0.05, float(profile_cfg.get("router_hard_timeout_ms", 1200)) / 1000.0),
                 *_get_classifier_connection(profile_cfg),
+                extra_body=_get_classifier_extra_body(profile_cfg),
             )
         except Exception:
             predicted = None
