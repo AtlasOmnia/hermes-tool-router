@@ -29,6 +29,7 @@ class Intent(str, Enum):
     DELEGATE = "delegate"
     GIT_OPERATION = "git_operation"
     ASK_CLARIFICATION = "ask_clarification"
+    CAPABILITY_INQUIRY = "capability_inquiry"
     FULL_SURFACE = "full_surface"
 
 
@@ -42,6 +43,61 @@ class IntentResult:
 _CONCEPTUAL = re.compile(
     r"^\s*(what\s+(?:is|are)|who\s+(?:is|are)|why\b|explain\b|define\b|"
     r"compare\b|difference\s+between\b|how\s+(?:does|do|can|to)\b)",
+    re.IGNORECASE,
+)
+# Questions about the assistant's own tools/capabilities.  Deliberately narrow:
+# polite requests ("can you read this file") must keep their action routing, so
+# a bare "can you <verb>" is NOT a capability inquiry; yes/no questions such as
+# "can you take screenshots?" are left to the ordinary rules (which usually
+# narrow them too, and the catalog still answers).  A match only counts when
+# the message is one standalone sentence directed at the assistant and carries
+# no task verb (see _is_capability_inquiry).
+_CAPABILITY_INQUIRY = re.compile(
+    r"\b(?:what|which)\b[^?.!\n]{0,40}\b(?:tools?|toolsets?|capabilit(?:y|ies)|abilities|integrations?)\b"
+    r"|\bwhat\s+(?:else\s+)?(?:can|could)\s+you\s+(?:do|help(?:\s+me)?\s+with|access|use)"
+    r"(?:\s+(?:for\s+me|for\s+us|here|today|in\s+this\s+session))?\s*[?.!]*\s*$"
+    r"|\bwhat\s+(?:do|does)\s+you\s+have\s+access\s+to\b"
+    r"|\bwhat\s+(?:are\s+you|is\s+this\s+assistant)\s+(?:able|capable)\b"
+    r"|\b(?:list|show|enumerate|tell\s+me)\b[^?.!\n]{0,20}\b(?:your|available|loaded)\b[^?.!\n]{0,12}\b(?:tools?|toolsets?|capabilit(?:y|ies))\b",
+    re.IGNORECASE,
+)
+_CAPABILITY_INQUIRY_MAX_CHARS = 160
+_INVENTORY_TERMS = frozenset(
+    [
+        "tool", "tools", "toolset", "toolsets", "capability", "capabilities", "ability",
+        "abilities", "integration", "integrations", "list", "show", "enumerate", "tell",
+        "else", "able", "capable", "assistant", "toolbox", "disposal", "equipped", "support",
+        "offer", "expose", "provide", "actually", "know", "u", "yourself",
+    ]
+)
+_INVENTORY_FILLER = frozenset(
+    [
+        "a", "access", "all", "an", "any", "are", "available", "can", "could", "currently",
+        "do", "does", "enabled", "for", "got", "have", "has", "help", "here", "hey", "hi",
+        "i", "in", "is", "just", "loaded", "me", "now", "of", "ok", "okay", "please",
+        "right", "session", "so", "the", "there", "these", "this", "to", "today", "use",
+        "using", "what", "which", "with", "you", "your", "yours", "exactly", "thanks", "thank",
+        "about",
+        "quick", "question", "would", "like", "i'd", "id", "at", "as", "kind", "kinds", "sort",
+        "sorts", "type", "types", "on", "hello", "there's", "what's", "whats", "you've", "youve"
+    ]
+)
+_ASSISTANT_DIRECTED = re.compile(
+    r"\b(?:you|your|yourself)\b"
+    r"|\b(?:tools?|toolsets?)\s+(?:are\s+)?(?:loaded|available|enabled)"
+    r"(?:\s+(?:right\s+)?now|\s+here|\s+in\s+this\s+session)?\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+# A task verb anywhere means the message asks for work, not an inventory.
+_TASK_VERB = re.compile(
+    r"\b(?:search|run|open|read|write|edit|install|build|test|send|create|fix|inspect|"
+    r"download|upload|delete|deploy|analy[sz]e|summari[sz]e|find|look\s*up|check|review|"
+    r"save|generate|make|draw|browse|click|commit|push)\b",
+    re.IGNORECASE,
+)
+# "what tools are used in this repo" is about a local object, not the assistant.
+_LOCAL_OBJECT = re.compile(
+    r"\b(?:this|my|the|our|a|an|that)\s+(?:file|folder|repo|repository|project|directory|codebase|code|package|app)\b",
     re.IGNORECASE,
 )
 _BROWSER_ACTION = re.compile(
@@ -208,6 +264,26 @@ def _english_imperative_material_precedes_sentence_final(text: str) -> bool:
     return bool(re.search(r"[^\W_]", between, re.UNICODE))
 
 
+def _is_capability_inquiry(text: str) -> bool:
+    if len(text) > _CAPABILITY_INQUIRY_MAX_CHARS or _URL.search(text):
+        return False
+    if _LOCAL_OBJECT.search(text) or _TASK_VERB.search(text):
+        return False
+    # Exactly one sentence: "What tools can you use? Then run pytest." is a task.
+    sentences = [part for part in re.split(r"[.?!;\n]+", text) if part.strip()]
+    if len(sentences) != 1 or re.search(r"\b(?:then|and\s+then|also)\b", text, re.IGNORECASE):
+        return False
+    match = _CAPABILITY_INQUIRY.search(text)
+    if not match or not _ASSISTANT_DIRECTED.search(text):
+        return False
+    # The whole message must be an inventory question: every word, inside
+    # or outside the matched phrase, must be inventory vocabulary or filler.
+    # "List your tools and schedule a reminder" ("schedule", "reminder") and
+    # "Show my cron jobs using your tools" ("my", "cron", "jobs") are tasks.
+    words = re.findall(r"[a-z']+", text.lower())
+    return all(word in _INVENTORY_FILLER or word in _INVENTORY_TERMS for word in words)
+
+
 def classify_intent(message: str) -> IntentResult:
     """Classify obvious intent; unresolved requests fail open upstream.
 
@@ -226,6 +302,12 @@ def classify_intent(message: str) -> IntentResult:
     lower = text.lower()
     if not text:
         return IntentResult(frozenset({Intent.FULL_SURFACE}), 0.0, "empty")
+
+    # Checked before conceptual phrasing: "what are your capabilities?" is a
+    # capability question, not general knowledge.  Anything that also carries
+    # a task is left to the ordinary rules.
+    if _is_capability_inquiry(text):
+        return IntentResult(frozenset({Intent.CAPABILITY_INQUIRY}), 0.97, "capability_inquiry")
 
     if _CONCEPTUAL.search(text) and not _CONCEPTUAL_FRESHNESS_OR_URL.search(lower):
         return IntentResult(frozenset({Intent.ANSWER_ONLY}), 0.99, "conceptual")

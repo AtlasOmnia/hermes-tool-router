@@ -46,6 +46,11 @@ TOOLSET_DESCRIPTIONS: Dict[str, str] = {
     "telegram":         "Telegram bot integration",
     "delegation":       "Delegate tasks to subagents",
     "messaging":        "Send messages through configured gateway platforms",
+    "computer_use":     "Control the desktop — screenshots, mouse, keyboard",
+    "session_search":   "Search and recall past conversations",
+    "cronjob":          "Create and manage scheduled jobs and reminders",
+    "todo":             "Track a task list for multi-step work",
+    "clarify":          "Ask the user structured clarifying questions",
 }
 TOOLSET_INTENT_RULES: List[tuple[str, Set[str]]] = [
     (r"\b(reddit|subreddit|r/[A-Za-z0-9_]+)\b", {"web", "browser"}),
@@ -88,7 +93,7 @@ Rules:
 2. confidence must be a number from 0.0 to 1.0.
 3. Include ONLY toolsets directly relevant to the user's request.
 4. Do not include terminal, file, or web unless the request actually needs them.
-5. For ordinary questions that can be answered without tools, return an empty array.
+5. For ordinary questions that can be answered without tools, return an empty array. Questions about the assistant's own capabilities or available tools ("what can you do?", "what tools do you have?") also return an empty array; a capability catalog is provided to the assistant separately.
 6. If the message is ambiguous or uncertain, return "all" as the only toolset.
 7. Be conservative; only include toolsets you are confident are needed.
 8. Personal calendar, itinerary, reservation, or flight-detail lookups require "skills" and "terminal" when those toolsets are available.
@@ -105,6 +110,7 @@ def _get_router_client(
     router_provider: str = "deepseek",
     custom_base_url: str = "",
     custom_api_key_env: str = "",
+    request_timeout: float = 8.0,
 ):
     """Obtain an OpenAI-compatible client for the router.
 
@@ -126,7 +132,7 @@ def _get_router_client(
             client = OpenAI(
                 api_key=api_key,
                 base_url="https://api.deepseek.com",
-                timeout=8,
+                timeout=request_timeout,
                 max_retries=0,
             )
             return client, router_model
@@ -139,7 +145,7 @@ def _get_router_client(
             client = OpenAI(
                 api_key=api_key,
                 base_url="https://openrouter.ai/api/v1",
-                timeout=8,
+                timeout=request_timeout,
                 max_retries=0,
                 default_headers={
                     "HTTP-Referer": "https://github.com/AtlasOmnia/hermes-tool-router",
@@ -163,7 +169,7 @@ def _get_router_client(
             client = OpenAI(
                 api_key=api_key,
                 base_url=custom_base_url,
-                timeout=2,
+                timeout=request_timeout,
                 max_retries=0,
             )
             return client, router_model
@@ -224,6 +230,10 @@ def _predict_toolsets_by_rules(
         and intent_result.reason_code == CHINESE_ABSTENTION_REASON
     ):
         return None, CHINESE_ABSTENTION_REASON
+    if intent_result.intents == frozenset({Intent.CAPABILITY_INQUIRY}):
+        # Answered from the session capability catalog carried by
+        # request_toolset; no execution toolsets are needed up front.
+        return set(), f"intent:{intent_result.reason_code}"
     if intent_result.intents == frozenset({Intent.ANSWER_ONLY}):
         return set(), f"intent:{intent_result.reason_code}"
     if Intent.FULL_SURFACE not in intent_result.intents:
@@ -282,6 +292,10 @@ def _extract_confidence(result: Any) -> Optional[float]:
 
         if parsed > 1 and parsed <= 100:
             parsed = parsed / 100.0
+
+        if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+            # e.g. 101 or "250%": malformed, never a pass.
+            return None
 
         return parsed
 
@@ -353,6 +367,16 @@ def parse_classifier_payload(
     if "all" in predicted_list:
         return {"action": "full"}
 
+    if any(not isinstance(name, str) for name in predicted_list):
+        return {"action": "full"}
+    unknown = set(predicted_list) - set(available_toolsets)
+    if unknown:
+        logger.debug(
+            "%s: router named unknown toolsets %s — full set fallback",
+            PLUGIN_NAME,
+            sorted(unknown),
+        )
+        return {"action": "full"}
     selected = set(predicted_list) & set(available_toolsets)
     if not selected and predicted_list:
         logger.debug(
@@ -383,11 +407,15 @@ def _predict_toolsets_via_llm(
     On any error, returns None for safe fallback.
     """
     try:
+        # The HTTP request may not outlive the routing hard timeout: once the
+        # route has failed open, a lingering request only holds a socket and
+        # a worker thread.
         client, model = _get_router_client(
             router_model,
             router_provider,
             custom_base_url,
             custom_api_key_env,
+            request_timeout=max(0.05, float(hard_timeout_seconds)),
         )
         if client is None:
             logger.debug(

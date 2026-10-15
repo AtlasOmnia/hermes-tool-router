@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -1785,7 +1786,17 @@ def test_worker_answer_only_keeps_pins_and_recovery_control_in_fixed_order(
     assert _rev6_names(agent) == ["kanban_complete", "kanban_show", "request_toolset"]
     assert "kanban_sibling" not in _rev6_names(agent)
     assert _rev6_names(agent)[-1] == "request_toolset"
-    assert agent.tools[-1] == registry.definitions["request_toolset"]
+    # The recovery control is an agent-local copy of the registry definition
+    # carrying this session's capability catalog; the shared registry
+    # definition itself is unchanged.
+    recovery = agent.tools[-1]
+    shared = registry.definitions["request_toolset"]
+    assert recovery["function"]["name"] == shared["function"]["name"]
+    assert recovery["function"]["parameters"] == shared["function"]["parameters"]
+    assert shared["function"]["description"] == "captured-request_toolset"
+    catalog = recovery["function"]["description"]
+    assert "kanban (" in catalog and "web (" in catalog
+    assert "kanban_sibling" not in catalog
 
 def test_no_authority_append_contaminates_session_and_forbids_later_host_capture(
     monkeypatch: pytest.MonkeyPatch,
@@ -2675,6 +2686,1430 @@ def test_incomplete_registration_preserves_admitted_surface_without_narrowing(
         router.__dict__.update(flags)
 
 
+
+# --- Session capability catalog (request_toolset description) -------------
+
+
+def _recovery_description(agent: Any) -> str:
+    recovery = [item for item in agent.tools if item["function"]["name"] == "request_toolset"]
+    assert len(recovery) == 1
+    return recovery[0]["function"]["description"]
+
+
+def _route(agent: Any, turn_id: str, message: str) -> None:
+    router.pre_turn_context_build(
+        agent=agent,
+        session_id=agent.session_id,
+        turn_id=turn_id,
+        user_message=message,
+    )
+
+
+@pytest.mark.parametrize("host_supplies_recovery", [False, True])
+def test_capability_question_sees_admitted_catalog_and_stays_stable(
+    monkeypatch: pytest.MonkeyPatch,
+    host_supplies_recovery: bool,
+) -> None:
+    registry = _Rev6Registry()
+    shared_before = json.dumps(registry.definitions["request_toolset"], sort_keys=True)
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    names = ("web_search", "read_file", "run_command", "kanban_show")
+    if host_supplies_recovery:
+        names = names + ("request_toolset",)
+    agent = _rev6_agent(
+        registry,
+        f"catalog-{host_supplies_recovery}",
+        names=names,
+        enabled=("web", "file", "terminal", "kanban", "router_recovery"),
+    )
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+
+    _route(agent, "catalog-1", "What can you do?")
+    # Option A: capability questions keep the small surface ...
+    assert _rev6_names(agent) == ["request_toolset"]
+    catalog = _recovery_description(agent)
+    # ... and the catalog names every admitted toolset with a description.
+    for toolset in ("web", "file", "terminal", "kanban"):
+        assert f"{toolset} (" in catalog, toolset
+    # Registry toolsets outside the admitted envelope are never advertised.
+    for outside in ("memory (", "skills (", "router_recovery"):
+        assert outside not in catalog, outside
+    assert "what you can do" in catalog
+    # The shared registry definition is untouched.
+    assert json.dumps(registry.definitions["request_toolset"], sort_keys=True) == shared_before
+
+    # A later capability question in the sticky session still sees the same
+    # catalog, byte for byte.
+    _route(agent, "catalog-2", "Which tools do you have access to?")
+    assert _recovery_description(agent) == catalog
+
+    # Recovery expansion keeps the catalog byte-stable.
+    response = json.loads(
+        router.request_toolset_handler(
+            {"toolsets": ["file"]},
+            agent=agent,
+            session_id=agent.session_id,
+        )
+    )
+    assert response["ok"] is True
+    assert "read_file" in _rev6_names(agent)
+    assert _recovery_description(agent) == catalog
+    assert json.dumps(registry.definitions["request_toolset"], sort_keys=True) == shared_before
+
+
+def test_catalog_is_deterministic_across_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    descriptions = []
+    for index, names in enumerate((
+        ("web_search", "read_file", "kanban_show"),
+        ("kanban_show", "read_file", "web_search"),
+    )):
+        agent = _rev6_agent(registry, f"determinism-{index}", names=names, enabled=("web", "file", "kanban"))
+        assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+        _route(agent, f"determinism-{index}", "hello")
+        descriptions.append(_recovery_description(agent))
+    assert descriptions[0] == descriptions[1]
+    assert "Capability catalog for this session" in descriptions[0]
+
+
+def test_host_protected_recovery_control_stays_byte_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry,
+        "protected-recovery",
+        names=("web_search", "kanban_show", "request_toolset"),
+        enabled=("web", "kanban", "router_recovery"),
+    )
+    metadata = {
+        "schema_version": 1,
+        "protected_toolsets": ["kanban"],
+        "pinned_tool_names": ["request_toolset"],
+    }
+    assert _rev6_admit(agent, monkeypatch, hook_metadata=metadata, owned=False).status == "READY"
+    _route(agent, "protected-recovery", "What can you do?")
+    assert _recovery_description(agent) == "captured-request_toolset"
+
+
+
+def test_catalog_describes_partial_admission_by_tool_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry,
+        "partial-catalog",
+        names=("web_search", "kanban_show"),
+        enabled=("web", "kanban"),
+    )
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    _route(agent, "partial-catalog", "What can you do?")
+    catalog = _recovery_description(agent)
+    # Only kanban_show was admitted, so the generic "create, assign, move"
+    # description must not be used.
+    assert "kanban (limited to: kanban_show)" in catalog
+    assert "create, assign, move" not in catalog
+    # web was admitted in full, so it keeps its generic description.
+    assert "web (Search and extract content from web pages)" in catalog
+
+
+def test_catalog_lists_unusual_identifiers_and_never_drops_overflow() -> None:
+    tools_mod = sys.modules["hermes_token_router_plugin.tools"]
+    admitted = {"mcp/custom": ["custom_tool"], "_custom": ["other"], "SyntheticCustom": ["x"]}
+    catalog = tools_mod.build_capability_catalog_description(admitted)
+    for name in ("mcp/custom (", "_custom (", "SyntheticCustom ("):
+        assert name in catalog, name
+    assert "router_recovery" not in tools_mod.build_capability_catalog_description({"router_recovery": ["request_toolset"]})
+
+    many = {f"toolset_{index:03d}": [f"tool_{index}"] for index in range(tools_mod.CATALOG_MAX_DESCRIBED + 5)}
+    catalog = tools_mod.build_capability_catalog_description(many)
+    for name in many:
+        assert name in catalog, name
+    assert "; also: " in catalog
+
+
+def test_recovery_parameter_description_is_generated_from_registry() -> None:
+    tools_mod = sys.modules["hermes_token_router_plugin.tools"]
+    schema = tools_mod.build_recovery_tool_schema({"web", "synthetic_custom_toolset"})
+    description = schema["parameters"]["properties"]["toolsets"]["description"]
+    assert "synthetic_custom_toolset" in description
+    assert "video_gen" not in description
+
+
+
+def test_host_protected_recovery_owner_stays_byte_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry,
+        "protected-recovery-owner",
+        names=("web_search", "kanban_show", "request_toolset"),
+        enabled=("web", "kanban", "router_recovery"),
+    )
+    metadata = {
+        "schema_version": 1,
+        "protected_toolsets": ["router_recovery"],
+        "pinned_tool_names": [],
+    }
+    assert _rev6_admit(agent, monkeypatch, hook_metadata=metadata, owned=False).status == "READY"
+    _route(agent, "protected-recovery-owner", "What can you do?")
+    assert "request_toolset" in _rev6_names(agent)
+    assert _recovery_description(agent) == "captured-request_toolset"
+
+
+def test_catalog_copy_parameter_names_the_session_catalog() -> None:
+    tools_mod = sys.modules["hermes_token_router_plugin.tools"]
+    base = tools_mod.build_recovery_tool_schema({"web", "file", "memory"})
+    definition = {"type": "function", "function": {"name": "request_toolset", **base}}
+    decorated = tools_mod.with_capability_catalog(definition, {"web": ["web_search"]})
+    param = decorated["function"]["parameters"]["properties"]["toolsets"]["description"]
+    assert "memory" not in param
+    assert "capability catalog" in param
+    # The source definition is not mutated.
+    assert "memory" in definition["function"]["parameters"]["properties"]["toolsets"]["description"]
+
+
+
+def _call_hook_on_worker_thread(agent_holder: Any, hook: Any, **kwargs: Any) -> None:
+    """Mimic current Hermes: the caller holds ``agent`` while a timeout worker runs the hook."""
+    import threading
+
+    agent = agent_holder  # noqa: F841 - must be a live local in this (caller) frame
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            hook(**kwargs)
+        except BaseException as exc:  # noqa: BLE001 - surfaced below
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert not errors, errors
+
+
+def test_pre_llm_call_on_worker_thread_finds_agent_by_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry,
+        "worker-thread-route",
+        names=("web_search", "read_file", "run_command"),
+        enabled=("web", "file", "terminal"),
+    )
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    router._drop_agent_ref(agent.session_id)
+    _call_hook_on_worker_thread(
+        agent,
+        router.pre_llm_call,
+        session_id=agent.session_id,
+        turn_id="worker-1",
+        user_message="search the web for news",
+    )
+    assert _rev6_names(agent) == ["web_search", "request_toolset"]
+
+
+def test_worker_thread_lookup_never_binds_another_sessions_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    other = _rev6_agent(
+        registry,
+        "worker-thread-other",
+        names=("web_search", "read_file", "run_command"),
+        enabled=("web", "file", "terminal"),
+    )
+    before = list(other.tools)
+    router._drop_agent_ref("worker-thread-unknown")
+    router._drop_agent_ref(other.session_id)
+    _call_hook_on_worker_thread(
+        other,
+        router.pre_llm_call,
+        session_id="worker-thread-unknown",
+        turn_id="worker-2",
+        user_message="search the web for news",
+    )
+    assert other.tools == before
+
+
+
+def test_tool_search_bridge_and_deferred_toolsets_survive_narrowing(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    # Hermes tool search: deferred tools (computer_use, cronjob, a protected
+    # deferred toolset) are absent from agent.tools and fronted by the bridge;
+    # their toolsets remain in enabled_toolsets.
+    agent = _rev6_agent(
+        registry,
+        "bridge-narrowing",
+        names=("web_search", "read_file", "run_command", "tool_search", "tool_describe", "tool_call"),
+        enabled=("web", "file", "terminal", "computer_use", "cronjob", "secret_deferred"),
+    )
+    metadata = {
+        "schema_version": 1,
+        "protected_toolsets": ["secret_deferred"],
+        "pinned_tool_names": [],
+    }
+    assert _rev6_admit(agent, monkeypatch, hook_metadata=metadata, owned=False).status == "READY"
+    _route(agent, "bridge-1", "search the web for news")
+    names = _rev6_names(agent)
+    assert names[:4] == ["web_search", "tool_search", "tool_describe", "tool_call"]
+    assert names[-1] == "request_toolset"
+    assert "read_file" not in names and "run_command" not in names
+    assert {"computer_use", "cronjob"} <= set(agent.enabled_toolsets)
+    assert "file" not in agent.enabled_toolsets
+    # A protected toolset is never re-enabled behind the bridge.
+    assert "secret_deferred" not in agent.enabled_toolsets
+    assert "tool_search" in _recovery_description(agent)
+
+    response = json.loads(
+        router.request_toolset_handler({"toolsets": ["file"]}, agent=agent, session_id=agent.session_id)
+    )
+    assert response["ok"] is True
+    assert {"tool_search", "tool_describe", "tool_call", "read_file"} <= set(_rev6_names(agent))
+    assert {"computer_use", "cronjob", "file"} <= set(agent.enabled_toolsets)
+    assert "secret_deferred" not in agent.enabled_toolsets
+
+
+def test_restore_returns_exact_enabled_toolsets_with_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    enabled = ("web", "file", "computer_use", "cronjob")
+    agent = _rev6_agent(
+        registry,
+        "bridge-restore",
+        names=("web_search", "read_file", "tool_search", "tool_describe", "tool_call"),
+        enabled=enabled,
+    )
+    original_tools = list(agent.tools)
+    admission = _rev6_admit(agent, monkeypatch, owned=False)
+    assert admission.status == "READY"
+    assert router.restore_admitted_envelope(agent, admission) is True
+    assert list(agent.tools) == original_tools
+    assert list(agent.enabled_toolsets) == list(enabled)
+
+
+
+# --- Review round 3 regressions ------------------------------------------
+
+
+def test_disabled_router_on_worker_thread_never_touches_the_surface(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry, enabled=False)
+    agent = _rev6_agent(
+        registry,
+        "disabled-worker",
+        names=("web_search", "read_file"),
+        enabled=("web", "file", "cronjob"),
+    )
+    router._drop_agent_ref(agent.session_id)
+    _call_hook_on_worker_thread(
+        agent, router.pre_llm_call,
+        session_id=agent.session_id, turn_id="d-1", user_message="hello",
+    )
+    assert list(agent.enabled_toolsets) == ["web", "file", "cronjob"]
+    late = {"type": "function", "function": {"name": "late_mcp_tool", "description": "late"}}
+    agent.tools = list(agent.tools) + [late]
+    agent.valid_tool_names = set(agent.valid_tool_names) | {"late_mcp_tool"}
+    agent.enabled_toolsets = list(agent.enabled_toolsets) + ["late_mcp"]
+    _call_hook_on_worker_thread(
+        agent, router.pre_llm_call,
+        session_id=agent.session_id, turn_id="d-2", user_message="hello again",
+    )
+    assert "late_mcp_tool" in _rev6_names(agent)
+    assert "late_mcp_tool" in agent.valid_tool_names
+    assert "late_mcp" in agent.enabled_toolsets
+
+
+def test_disabling_after_narrowing_restores_once_then_stays_hands_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    config = {
+        "enabled": True, "long_message_decline_chars": 10_000, "short_message_bypass_chars": 0,
+        "floor_toolsets": [], "deterministic_rules_enabled": True, "confidence_threshold": 0.0,
+        "router_hard_timeout_ms": 1_200, "classifier": {"enabled": False},
+    }
+    monkeypatch.setattr(router, "_load_config", lambda: {"global": config})
+    monkeypatch.setattr(router, "_get_profile_config", lambda *a, **k: config)
+    monkeypatch.setattr(router, "_get_available_toolsets", lambda: set(registry.toolsets))
+    agent = _rev6_agent(registry, "disable-after-narrow", names=("web_search", "read_file"), enabled=("web", "file"))
+    original = list(agent.tools)
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    _route(agent, "n-1", "search the web for news")
+    assert "read_file" not in _rev6_names(agent)
+    config["enabled"] = False
+    _route(agent, "n-2", "next")
+    assert list(agent.tools) == original
+    late = {"type": "function", "function": {"name": "late_mcp_tool", "description": "late"}}
+    agent.tools = list(agent.tools) + [late]
+    _route(agent, "n-3", "and again")
+    assert "late_mcp_tool" in _rev6_names(agent)
+
+
+def test_route_rejects_stack_agent_with_a_different_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(registry, "actual-session", names=("web_search", "read_file"), enabled=("web", "file"))
+    before = list(agent.tools)
+    router._drop_agent_ref("different-hook-session")
+    router.pre_llm_call(session_id="different-hook-session", turn_id="x", user_message="search the web")
+    assert agent.tools == before
+    assert router._get_agent_ref("different-hook-session") is not agent
+
+
+def test_thread_scan_rejects_duplicate_session_ids_and_survives_hostile_objects() -> None:
+    import threading
+
+    state_mod = sys.modules["hermes_token_router_plugin.state"]
+
+    class Hostile:
+        session_id = "dup-session"
+
+        @property
+        def tools(self):  # pragma: no cover - must never be reached first
+            raise RuntimeError("hostile property")
+
+    def holder(obj: Any, ready: threading.Event, release: threading.Event) -> None:
+        agent = obj  # noqa: F841 - live local for the scan
+        ready.set()
+        release.wait(5)
+
+    def hostile_holder(ready: threading.Event, release: threading.Event) -> None:
+        self = Hostile()  # noqa: F841 - live 'self' local
+        ready.set()
+        release.wait(5)
+
+    first = SimpleNamespace(session_id="dup-session", tools=[], valid_tool_names=set(), enabled_toolsets=[])
+    second = SimpleNamespace(session_id="dup-session", tools=[], valid_tool_names=set(), enabled_toolsets=[])
+    release = threading.Event()
+    events = [threading.Event() for _ in range(3)]
+    threads = [
+        threading.Thread(target=holder, args=(first, events[0], release)),
+        threading.Thread(target=holder, args=(second, events[1], release)),
+        threading.Thread(target=hostile_holder, args=(events[2], release)),
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        for event in events:
+            assert event.wait(5)
+        assert state_mod._find_agent_in_threads("dup-session") is None
+        assert state_mod._find_agent_in_threads("no-such-session") is None
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(5)
+
+
+def test_explicit_agent_beats_a_stale_cached_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    stale = _rev6_agent(registry, "explicit-wins", names=("web_search",), enabled=("web",))
+    fresh = _rev6_agent(registry, "explicit-wins", names=("web_search",), enabled=("web",))
+    router._store_agent_ref(stale, "explicit-wins")
+    assert router._resolve_hook_agent(fresh, "explicit-wins") is fresh
+
+
+def test_protected_deferred_sibling_is_blocked_behind_the_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry,
+        "protected-bridge",
+        names=("web_search", "kanban_show", "tool_search", "tool_describe", "tool_call"),
+        enabled=("web", "kanban"),
+    )
+    metadata = {"schema_version": 1, "protected_toolsets": ["kanban"], "pinned_tool_names": ["kanban_show"]}
+    assert _rev6_admit(agent, monkeypatch, hook_metadata=metadata, owned=False).status == "READY"
+    _route(agent, "pb-1", "What can you do?")
+    assert "kanban" in agent.enabled_toolsets and "tool_call" in _rev6_names(agent)
+    blocked = router.pre_tool_call(tool_name="kanban_sibling", session_id=agent.session_id, args={})
+    assert isinstance(blocked, dict) and blocked["action"] == "block"
+    # Visible/captured tools and ordinary deferred tools are untouched.
+    assert router.pre_tool_call(tool_name="kanban_show", session_id=agent.session_id, args={}) is None
+    assert router.pre_tool_call(tool_name="memory_search", session_id=agent.session_id, args={}) is None
+
+
+def test_restore_assigns_the_exact_captured_enabled_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    for names, enabled in (
+        (("web_search", "tool_search", "tool_describe", "tool_call"), ("cronjob",)),
+        (("web_search", "read_file"), ("web", "file", "cronjob")),
+    ):
+        agent = _rev6_agent(registry, f"exact-{len(names)}", names=names, enabled=enabled)
+        admission = _rev6_admit(agent, monkeypatch, owned=False)
+        assert admission.status == "READY"
+        assert router.restore_admitted_envelope(agent, admission) is True
+        assert list(agent.enabled_toolsets) == list(enabled)
+
+
+
+# --- Review round 4 regressions ------------------------------------------
+
+
+def _narrowed_protected_bridge_agent(monkeypatch: pytest.MonkeyPatch, session: str, config: dict) -> Any:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    monkeypatch.setattr(router, "_load_config", lambda: {"global": config})
+    monkeypatch.setattr(router, "_get_profile_config", lambda *a, **k: config)
+    monkeypatch.setattr(router, "_get_available_toolsets", lambda: set(registry.toolsets))
+    agent = _rev6_agent(
+        registry,
+        session,
+        names=("web_search", "kanban_show", "tool_search", "tool_describe", "tool_call"),
+        enabled=("web", "kanban"),
+    )
+    metadata = {"schema_version": 1, "protected_toolsets": ["kanban"], "pinned_tool_names": ["kanban_show"]}
+    assert _rev6_admit(agent, monkeypatch, hook_metadata=metadata, owned=False).status == "READY"
+    _route(agent, f"{session}-1", "What can you do?")
+    return agent
+
+
+def _base_config() -> dict:
+    return {
+        "enabled": True, "long_message_decline_chars": 10_000, "short_message_bypass_chars": 0,
+        "floor_toolsets": [], "deterministic_rules_enabled": True, "confidence_threshold": 0.0,
+        "router_hard_timeout_ms": 1_200, "classifier": {"enabled": False},
+    }
+
+
+def test_failed_disable_restore_keeps_guard_and_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "failed-restore", config)
+    blocked = router.pre_tool_call(tool_name="kanban_sibling", session_id=agent.session_id, args={})
+    assert blocked and blocked["action"] == "block"
+    config["enabled"] = False
+    real_restore = router.restore_admitted_envelope
+    monkeypatch.setattr(router, "restore_admitted_envelope", lambda *a, **k: False)
+    _route(agent, "failed-restore-2", "next")
+    state = router._get_router_state(agent)
+    assert state.surface_narrowed is True
+    still = router.pre_tool_call(tool_name="kanban_sibling", session_id=agent.session_id, args={})
+    assert still and still["action"] == "block"
+    monkeypatch.setattr(router, "restore_admitted_envelope", real_restore)
+    _route(agent, "failed-restore-3", "again")
+    assert state.surface_narrowed is False
+    assert "kanban_show" in _rev6_names(agent) and "web_search" in _rev6_names(agent)
+
+
+def test_explicit_route_agent_from_another_session_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(registry, "actual-explicit", names=("web_search", "read_file"), enabled=("web", "file"))
+    before = list(agent.tools)
+    router._drop_agent_ref("wrong-explicit")
+    router.pre_turn_context_build(
+        agent=agent, session_id="wrong-explicit", turn_id="w", user_message="search the web",
+    )
+    assert agent.tools == before
+    assert router._get_agent_ref("wrong-explicit") is not agent
+
+
+def test_thread_scan_treats_agent_and_self_duplicates_as_ambiguous() -> None:
+    import threading
+
+    state_mod = sys.modules["hermes_token_router_plugin.state"]
+    first = SimpleNamespace(session_id="tier-dup", tools=[], valid_tool_names=set(), enabled_toolsets=[])
+    second = SimpleNamespace(session_id="tier-dup", tools=[], valid_tool_names=set(), enabled_toolsets=[])
+    release = threading.Event()
+    ready = [threading.Event(), threading.Event()]
+
+    def as_agent() -> None:
+        agent = first  # noqa: F841
+        ready[0].set()
+        release.wait(5)
+
+    def as_self() -> None:
+        self = second  # noqa: F841
+        ready[1].set()
+        release.wait(5)
+
+    threads = [threading.Thread(target=as_agent), threading.Thread(target=as_self)]
+    for thread in threads:
+        thread.start()
+    try:
+        assert all(event.wait(5) for event in ready)
+        assert state_mod._find_agent_in_threads("tier-dup") is None
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(5)
+
+
+def test_session_end_restores_and_resets_for_agent_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "session-end", config)
+    state = router._get_router_state(agent)
+    assert state.surface_narrowed is True
+    router.on_session_end(session_id=agent.session_id, agent=agent)
+    assert state.surface_narrowed is False
+    assert state.initial_route_applied is False
+    assert "web_search" in _rev6_names(agent) and "kanban_show" in _rev6_names(agent)
+    state.surface_narrowed = True
+    state.reset()
+    assert state.surface_narrowed is False
+
+
+def test_own_stack_checks_session_before_touching_foreign_properties() -> None:
+    state_mod = sys.modules["hermes_token_router_plugin.state"]
+    touched: list[str] = []
+
+    class Foreign:
+        session_id = "someone-else"
+
+        @property
+        def tools(self):
+            touched.append("tools")
+            raise RuntimeError("must not be read")
+
+    agent = Foreign()  # noqa: F841 - live local for the own-stack walk
+    assert state_mod._get_agent_from_stack("my-session", scan_threads=False) is None
+    assert touched == []
+
+
+
+# --- Review round 5 regressions ------------------------------------------
+
+
+def _fail_restore_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = router.restore_admitted_envelope
+    calls = {"n": 0}
+
+    def flaky(*args: Any, **kwargs: Any) -> bool:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return False
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(router, "restore_admitted_envelope", flaky)
+
+
+def test_failed_session_end_restore_keeps_admission_guard_and_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "failed-end", config)
+    state = router._get_router_state(agent)
+    _fail_restore_once(monkeypatch)
+    router.on_session_end(session_id=agent.session_id, agent=agent)
+    assert state.surface_narrowed is True
+    assert state.bound_host_admission(agent.session_id) is not None
+    blocked = router.pre_tool_call(tool_name="kanban_sibling", session_id=agent.session_id, args={})
+    assert blocked and blocked["action"] == "block"
+    # Retry: a second session end (or a disabled turn) restores and retires.
+    router.on_session_end(session_id=agent.session_id, agent=agent)
+    assert state.surface_narrowed is False
+    assert state.bound_host_admission(agent.session_id) is None
+    assert "web_search" in _rev6_names(agent)
+
+
+def test_failed_session_end_then_disabled_turn_restores(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "failed-end-disabled", config)
+    state = router._get_router_state(agent)
+    _fail_restore_once(monkeypatch)
+    router.on_session_end(session_id=agent.session_id, agent=agent)
+    config["enabled"] = False
+    _route(agent, "failed-end-disabled-2", "next")
+    assert state.surface_narrowed is False
+    assert "web_search" in _rev6_names(agent)
+
+
+def test_stale_route_after_session_end_and_reuse_never_commits(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(registry, "stale-old", names=("web_search", "read_file"), enabled=("web", "file"))
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    entered = threading.Event()
+    release = threading.Event()
+    real_rules = router._predict_toolsets_by_rules
+
+    def paused_rules(message: str, available: set[str]):
+        entered.set()
+        release.wait(5)
+        return real_rules(message, available)
+
+    monkeypatch.setattr(router, "_predict_toolsets_by_rules", paused_rules)
+    worker = threading.Thread(
+        target=lambda: router.pre_turn_context_build(
+            agent=agent, session_id="stale-old", turn_id="s-1", user_message="search the web for news",
+        )
+    )
+    worker.start()
+    assert entered.wait(5)
+    # The host gives up on the hook, ends the session and reuses the agent.
+    router.on_session_end(session_id="stale-old", agent=agent)
+    file_only = [registry.definitions["read_file"]]
+    agent.session_id = "stale-new"
+    agent.tools = list(file_only)
+    agent.valid_tool_names = {"read_file"}
+    agent.enabled_toolsets = ["file"]
+    release.set()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert agent.tools == file_only
+    assert agent.enabled_toolsets == ["file"]
+    assert router._get_router_state(agent).surface_narrowed is False
+
+
+def test_route_commit_deadline_discards_slow_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(registry, "deadline", names=("web_search", "read_file"), enabled=("web", "file"))
+    before = list(agent.tools)
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    monkeypatch.setattr(router, "_hook_commit_budget_s", lambda: -1.0)
+    _route(agent, "deadline-1", "search the web for news")
+    assert agent.tools == before
+
+
+
+# --- Follow-ups ------------------------------------------------------------
+
+
+def test_skill_view_stays_visible_after_narrowing(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry, "skills-floor",
+        names=("web_search", "read_file", "skill_view"), enabled=("web", "file", "skills"),
+    )
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    _route(agent, "skills-floor-1", "search the web for news")
+    names = _rev6_names(agent)
+    assert "skill_view" in names and "read_file" not in names
+    assert "skills" in agent.enabled_toolsets
+
+
+def test_protected_skills_are_not_kept_unless_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry, "skills-protected",
+        names=("web_search", "skill_view"), enabled=("web", "skills"),
+    )
+    metadata = {"schema_version": 1, "protected_toolsets": ["skills"], "pinned_tool_names": []}
+    assert _rev6_admit(agent, monkeypatch, hook_metadata=metadata, owned=False).status == "READY"
+    _route(agent, "skills-protected-1", "search the web for news")
+    assert "skill_view" not in _rev6_names(agent)
+
+
+
+def test_classifier_rejects_out_of_range_confidence_and_unknown_toolsets() -> None:
+    policy = sys.modules["hermes_token_router_plugin.policy"]
+    available = {"web", "file"}
+    for confidence in (101, "101%", 250, -1, "nan"):
+        payload = json.dumps({"toolsets": ["web"], "confidence": confidence})
+        assert policy.parse_classifier_payload(payload, available, 0.9) == {"action": "full"}, confidence
+    for confidence in (0.95, 95, "95%"):
+        payload = json.dumps({"toolsets": ["web"], "confidence": confidence})
+        assert policy.parse_classifier_payload(payload, available, 0.9) == {"action": "narrow", "toolsets": ["web"]}
+    mixed = json.dumps({"toolsets": ["web", "bogus"], "confidence": 0.99})
+    assert policy.parse_classifier_payload(mixed, available, 0.9) == {"action": "full"}
+
+
+def test_classifier_http_timeout_follows_hard_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    policy = sys.modules["hermes_token_router_plugin.policy"]
+    seen: dict[str, float] = {}
+
+    def fake_client(model, provider, base_url, key_env, request_timeout=8.0):
+        seen["timeout"] = request_timeout
+        return None, None
+
+    monkeypatch.setattr(policy, "_get_router_client", fake_client)
+    assert policy._predict_toolsets_via_llm("hi", {"web"}, "m", 0.9, "openrouter", 1.2) is None
+    assert seen["timeout"] == pytest.approx(1.2)
+
+
+def test_floor_defaults_to_none_when_unconfigured(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    config = _base_config()
+    config.pop("floor_toolsets")
+    monkeypatch.setattr(router, "_load_config", lambda: {"global": config})
+    monkeypatch.setattr(router, "_get_profile_config", lambda *a, **k: config)
+    monkeypatch.setattr(router, "_get_available_toolsets", lambda: set(registry.toolsets))
+    agent = _rev6_agent(registry, "floor-default", names=("web_search", "read_file", "run_command"), enabled=("web", "file", "terminal"))
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    _route(agent, "floor-default-1", "search the web for news")
+    assert _rev6_names(agent) == ["web_search", "request_toolset"]
+
+
+def test_request_toolset_payload_truthfulness(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    registry.toolsets["MixedCase"] = ["mixed_tool"]
+    registry.definitions["mixed_tool"] = {
+        "type": "function",
+        "function": {"name": "mixed_tool", "description": "m", "parameters": {"type": "object", "properties": {}}},
+    }
+    registry.entries["mixed_tool"] = SimpleNamespace(toolset="MixedCase")
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry, "payload-truth",
+        names=("web_search", "read_file", "mixed_tool"), enabled=("web", "file", "MixedCase"),
+    )
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    _route(agent, "payload-truth-1", "search the web for news")
+    ok = json.loads(router.request_toolset_handler(
+        {"toolsets": ["file"], "reason": "need to read notes"}, agent=agent, session_id=agent.session_id,
+    ))
+    assert ok["ok"] is True and ok["reason"] == "READY" and ok["request_reason"] == "need to read notes"
+    mixed = json.loads(router.request_toolset_handler(
+        {"toolsets": ["MixedCase"]}, agent=agent, session_id=agent.session_id,
+    ))
+    assert mixed["ok"] is True and "mixed_tool" in _rev6_names(agent)
+    missing = json.loads(router.request_toolset_handler(
+        {"tool_name": "no_such_tool"}, agent=agent, session_id=agent.session_id,
+    ))
+    assert missing["ok"] is False and "no_such_tool" in missing["denied_tool_names"]
+
+
+def test_retry_latch_resets_only_on_a_new_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(registry, "retry-latch", names=("web_search", "read_file"), enabled=("web", "file"))
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    _route(agent, "retry-latch-1", "search the web for news")
+    state = router._get_router_state(agent)
+    state._retry_pending = True
+    router.pre_llm_call(session_id=agent.session_id, turn_id="retry-latch-1", user_message="same turn")
+    assert state._retry_pending is True
+    router.pre_llm_call(session_id=agent.session_id, turn_id="retry-latch-2", user_message="next")
+    assert state._retry_pending is False
+    state._retry_pending = True
+    router.pre_llm_call(session_id=agent.session_id, turn_id="retry-latch-2", user_message="again")
+    assert state._retry_pending is True
+
+
+# --- Review round 6 regressions ------------------------------------------
+
+
+_UNSET = object()
+
+
+def _pause(
+    monkeypatch: pytest.MonkeyPatch, module: Any, name: str, result: Any = _UNSET, *, once: bool = False
+):
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    real = getattr(module, name)
+    calls = {"n": 0}
+
+    def paused(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if not once or calls["n"] == 1:
+            entered.set()
+            release.wait(5)
+        return real(*args, **kwargs) if result is _UNSET else result
+
+    monkeypatch.setattr(module, name, paused)
+    return entered, release
+
+
+def _end_and_reuse_file_only(agent: Any, registry: Any, old: str, new: str) -> list[dict[str, Any]]:
+    router.on_session_end(session_id=old, agent=agent)
+    file_only = [registry.definitions["read_file"]]
+    agent.session_id = new
+    agent.tools = list(file_only)
+    agent.valid_tool_names = {"read_file"}
+    agent.enabled_toolsets = ["file"]
+    return file_only
+
+
+def _run_paused(target: Any, entered: Any, release: Any, between: Any) -> None:
+    import threading
+
+    worker = threading.Thread(target=target)
+    worker.start()
+    assert entered.wait(5)
+    # Session end and reuse must not wait for the paused hook: slow work
+    # runs outside the mutation lock.
+    host = threading.Thread(target=between)
+    host.start()
+    host.join(2)
+    blocked_on_hook = host.is_alive()
+    release.set()
+    host.join(5)
+    assert not blocked_on_hook
+    worker.join(5)
+    assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("pause", ["unresolved_prediction", "registry_selection"])
+def test_stale_fallback_or_selection_never_commits_after_reuse(
+    monkeypatch: pytest.MonkeyPatch, pause: str
+) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(registry, f"r6-{pause}", names=("web_search", "read_file"), enabled=("web", "file"))
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    if pause == "unresolved_prediction":
+        # Paused, then the prediction is unresolved -> restore fallback path.
+        entered, release = _pause(monkeypatch, router, "_predict_toolsets_by_rules", (None, []))
+    else:
+        # Paused inside selection, after every route-level check.
+        entered, release = _pause(monkeypatch, sys.modules["hermes_token_router_plugin.tools"], "_registry_object")
+    holder: dict[str, Any] = {}
+    _run_paused(
+        lambda: router.pre_turn_context_build(
+            agent=agent, session_id=f"r6-{pause}", turn_id="r6-1", user_message="search the web for news",
+        ),
+        entered,
+        release,
+        lambda: holder.setdefault("file_only", _end_and_reuse_file_only(agent, registry, f"r6-{pause}", "r6-new")),
+    )
+    state = router._get_router_state(agent)
+    assert agent.tools == holder["file_only"]
+    assert agent.enabled_toolsets == ["file"]
+    assert state.initial_route_applied is False
+    assert state.surface_narrowed is False
+    assert state.bound_host_admission("r6-new") is None
+
+
+def test_stale_post_tool_expansion_never_commits_after_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(registry, "r6-post", names=("web_search", "read_file"), enabled=("web", "file"))
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    _route(agent, "r6-post-1", "search the web for news")
+    entered, release = _pause(monkeypatch, sys.modules["hermes_token_router_plugin.tools"], "_registry_object")
+    holder: dict[str, Any] = {}
+    _run_paused(
+        lambda: router.post_tool_call(agent=agent, session_id="r6-post", tool_name="read_file", args={}),
+        entered,
+        release,
+        lambda: holder.setdefault("file_only", _end_and_reuse_file_only(agent, registry, "r6-post", "r6-post-new")),
+    )
+    state = router._get_router_state(agent)
+    assert agent.tools == holder["file_only"]
+    assert state._retry_pending is False
+
+
+def test_deadline_counts_config_time_and_follows_host_normalization(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time as time_mod
+
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(registry, "r6-deadline", names=("web_search", "read_file"), enabled=("web", "file"))
+    before = list(agent.tools)
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+
+    def slow_timeout() -> float:
+        time_mod.sleep(0.3)
+        return 0.4  # budget 0.2 s, already spent reading config
+
+    monkeypatch.setattr(router, "_hook_callback_timeout_s", slow_timeout)
+    _route(agent, "r6-deadline-1", "search the web for news")
+    assert agent.tools == before
+    monkeypatch.setattr(router, "_hook_callback_timeout_s", lambda: 0.0)
+    assert router._hook_commit_budget_s() == float("inf")
+    monkeypatch.setattr(router, "_hook_callback_timeout_s", lambda: 0.1)
+    assert router._hook_commit_budget_s() == pytest.approx(0.05)
+
+
+def test_local_timeout_normalization_matches_hermes(monkeypatch: pytest.MonkeyPatch) -> None:
+    plugins_mod = ModuleType("hermes_cli.plugins")
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins_mod)  # no resolver -> local path
+    config_mod = ModuleType("hermes_cli.config")
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config_mod)
+    for configured, expected in ((None, 30.0), (0, 0.0), (2000, 600.0), (-5, 30.0), ("x", 30.0), (12, 12.0)):
+        plugins_cfg = {} if configured is None else {"hook_callback_timeout": configured}
+        config_mod.load_config_readonly = lambda c=plugins_cfg: {"plugins": c}
+        assert router._hook_callback_timeout_s() == expected, configured
+
+
+def test_reuse_after_failed_end_is_quarantined_until_restore(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "r6-quarantine", config)
+    state = router._get_router_state(agent)
+    real_restore = router.restore_admitted_envelope
+    monkeypatch.setattr(router, "restore_admitted_envelope", lambda *a, **k: False)
+    router.on_session_end(session_id="r6-quarantine", agent=agent)
+    narrowed = list(agent.tools)
+    agent.session_id = "r6-quarantine-new"
+    blocked = router.pre_tool_call(tool_name="kanban_sibling", session_id="r6-quarantine-new", args={})
+    assert blocked and blocked["action"] == "block"
+    # Routing a new session while the old surface is unrestored changes nothing.
+    _route(agent, "r6-q-1", "search the web for news")
+    assert agent.tools == narrowed
+    assert state._retired_admission is not None
+    # Once the restore works, the agent is released and starts fresh.
+    monkeypatch.setattr(router, "restore_admitted_envelope", real_restore)
+    _route(agent, "r6-q-2", "search the web for news")
+    assert state._retired_admission is None
+    assert router.pre_tool_call(tool_name="kanban_sibling", session_id="r6-quarantine-new", args={}) is None or (
+        state.bound_host_admission("r6-quarantine-new") is not None
+    )
+
+
+def test_case_insensitive_toolset_match_must_be_unique() -> None:
+    assert router._normalize_toolset_name("TEAM", {"Team", "team"}) == "TEAM"
+    assert router._normalize_toolset_name("team", {"Team", "team"}) == "team"
+    assert router._normalize_toolset_name("mixedcase", {"MixedCase", "web"}) == "MixedCase"
+    assert router._normalize_toolset_name("WEB", {"web"}) == "web"
+    assert router._normalize_toolset_name("Unknown", {"web"}) == "unknown"
+
+
+# --- Review round 7 regressions ------------------------------------------
+
+_TOOLS_MOD = "hermes_token_router_plugin.tools"
+
+
+def _three_tool_agent(monkeypatch: pytest.MonkeyPatch, sid: str, *, admit: bool = True):
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry, sid, names=("web_search", "read_file", "run_command"), enabled=("web", "file", "terminal"),
+    )
+    if admit:
+        assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    return registry, agent
+
+
+def test_first_capture_lookup_is_unlocked_and_never_binds_late(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry, agent = _three_tool_agent(monkeypatch, "r7-capture", admit=False)
+    entered, release = _pause(monkeypatch, router, "_capture_owner_snapshot")
+    holder: dict[str, Any] = {}
+    _run_paused(
+        lambda: router.pre_turn_context_build(
+            agent=agent, session_id="r7-capture", turn_id="c-1", user_message="search the web for news",
+        ),
+        entered,
+        release,
+        lambda: holder.setdefault("file_only", _end_and_reuse_file_only(agent, registry, "r7-capture", "r7-capture-new")),
+    )
+    state = router._get_router_state(agent)
+    assert agent.tools == holder["file_only"]
+    assert state._admission_session_id is None
+    assert state.bound_host_admission("r7-capture-new") is None
+
+
+def test_post_tool_admission_is_fenced(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(registry, "r7-post-adm", names=("web_search", "read_file"), enabled=("web", "file"))
+    entered, release = _pause(monkeypatch, router, "_compose_effective_policy")
+    holder: dict[str, Any] = {}
+    _run_paused(
+        lambda: router.post_tool_call(agent=agent, session_id="r7-post-adm", tool_name="run_command", args={}),
+        entered,
+        release,
+        lambda: holder.setdefault("file_only", _end_and_reuse_file_only(agent, registry, "r7-post-adm", "r7-post-new")),
+    )
+    state = router._get_router_state(agent)
+    assert state._admission_session_id is None
+    assert agent.tools == holder["file_only"]
+
+
+@pytest.mark.parametrize("entry", ["middleware", "visible_request"])
+def test_recovery_entry_points_are_fenced(monkeypatch: pytest.MonkeyPatch, entry: str) -> None:
+    registry, agent = _three_tool_agent(monkeypatch, f"r7-{entry}")
+    _route(agent, f"r7-{entry}-1", "search the web for news")
+    entered, release = _pause(monkeypatch, sys.modules[_TOOLS_MOD], "_registry_object")
+    if entry == "middleware":
+        call = lambda: router.tool_request_middleware(
+            agent=agent, session_id=f"r7-{entry}", tool_name="run_command", args={},
+        )
+    else:
+        call = lambda: router.request_toolset_handler(
+            {"tool_name": "run_command"}, agent=agent, session_id=f"r7-{entry}",
+        )
+    holder: dict[str, Any] = {}
+    _run_paused(
+        call,
+        entered,
+        release,
+        lambda: holder.setdefault("file_only", _end_and_reuse_file_only(agent, registry, f"r7-{entry}", "r7-new")),
+    )
+    assert agent.tools == holder["file_only"]
+    assert agent.enabled_toolsets == ["file"]
+
+
+def test_failed_end_revokes_in_flight_expansion(monkeypatch: pytest.MonkeyPatch) -> None:
+    _registry, agent = _three_tool_agent(monkeypatch, "r7-revoke")
+    _route(agent, "r7-revoke-1", "search the web for news")
+    state = router._get_router_state(agent)
+    narrowed = list(agent.tools)
+    entered, release = _pause(monkeypatch, sys.modules[_TOOLS_MOD], "_registry_object")
+    monkeypatch.setattr(router, "restore_admitted_envelope", lambda *a, **k: False)
+    _run_paused(
+        lambda: router.post_tool_call(agent=agent, session_id="r7-revoke", tool_name="run_command", args={}),
+        entered,
+        release,
+        lambda: router.on_session_end(session_id="r7-revoke", agent=agent),
+    )
+    assert agent.tools == narrowed
+    assert state._retry_pending is False
+    assert state._retired_admission is not None
+
+
+def test_retired_restore_respects_deadline_and_host_replacement(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "r7-retired", config)
+    state = router._get_router_state(agent)
+    real_restore = router.restore_admitted_envelope
+    monkeypatch.setattr(router, "restore_admitted_envelope", lambda *a, **k: False)
+    router.on_session_end(session_id="r7-retired", agent=agent)
+    narrowed = list(agent.tools)
+    agent.session_id = "r7-retired-new"
+    monkeypatch.setattr(router, "restore_admitted_envelope", real_restore)
+    # An expired hook never restores the retired surface.
+    monkeypatch.setattr(router, "_hook_commit_budget_s", lambda: -1.0)
+    _route(agent, "r7-r-1", "search the web for news")
+    assert agent.tools == narrowed and state._retired_admission is not None
+    # The host replaced the surface: old-session tools are never written over
+    # it, and the ambiguous change does not release the quarantine either.
+    monkeypatch.setattr(router, "_hook_commit_budget_s", lambda: 15.0)
+    replacement = list(narrowed[:1])
+    agent.tools = list(replacement)
+    agent.valid_tool_names = {replacement[0]["function"]["name"]}
+    router.pre_turn_context_build(agent=agent, session_id="r7-retired-new", turn_id="r7-r-2", user_message="")
+    assert state._retired_admission is not None
+    assert agent.tools == replacement
+
+
+def test_overlapping_expansions_do_not_lose_updates(monkeypatch: pytest.MonkeyPatch) -> None:
+    _registry, agent = _three_tool_agent(monkeypatch, "r7-lost")
+    _route(agent, "r7-lost-1", "search the web for news")
+    entered, release = _pause(monkeypatch, sys.modules[_TOOLS_MOD], "_registry_object", once=True)
+    _run_paused(
+        lambda: router.post_tool_call(agent=agent, session_id="r7-lost", tool_name="run_command", args={}),
+        entered,
+        release,
+        lambda: router.tool_request_middleware(agent=agent, session_id="r7-lost", tool_name="read_file", args={}),
+    )
+    names = _rev6_names(agent)
+    assert "read_file" in names and "run_command" in names and "web_search" in names
+
+
+def test_explicit_request_does_not_reset_the_retry_latch(monkeypatch: pytest.MonkeyPatch) -> None:
+    _registry, agent = _three_tool_agent(monkeypatch, "r7-latch")
+    _route(agent, "r7-latch-1", "search the web for news")
+    state = router._get_router_state(agent)
+    router.post_tool_call(agent=agent, session_id="r7-latch", tool_name="read_file", args={})
+    assert state._retry_pending is True
+    router.request_toolset_handler({"tool_name": "run_command"}, agent=agent, session_id="r7-latch")
+    assert state._retry_pending is True
+
+
+# --- Review round 8 regressions ------------------------------------------
+
+
+def _quarantined_agent(monkeypatch: pytest.MonkeyPatch, sid: str):
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, sid, config)
+    state = router._get_router_state(agent)
+    real_restore = router.restore_admitted_envelope
+    monkeypatch.setattr(router, "restore_admitted_envelope", lambda *a, **k: False)
+    router.on_session_end(session_id=sid, agent=agent)
+    monkeypatch.setattr(router, "restore_admitted_envelope", real_restore)
+    agent.session_id = f"{sid}-new"
+    assert state._retired_admission is not None
+    return agent, state
+
+
+def test_same_name_replacement_is_not_overwritten_by_retired_restore(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent, state = _quarantined_agent(monkeypatch, "r8-same-name")
+    replaced = copy.deepcopy(agent.tools)
+    for definition in replaced:
+        definition["function"]["description"] = "host replacement"
+    agent.tools = replaced
+    agent.enabled_toolsets = ["web"]
+    _route(agent, "r8-sn-1", "search the web for news")
+    assert agent.tools == replaced and agent.enabled_toolsets == ["web"]
+    assert state._retired_admission is not None
+
+
+def test_partial_addition_keeps_quarantine_and_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent, state = _quarantined_agent(monkeypatch, "r8-partial")
+    extra = {"type": "function", "function": {"name": "extra_tool", "description": "x", "parameters": {"type": "object", "properties": {}}}}
+    agent.tools = list(agent.tools) + [extra]
+    _route(agent, "r8-p-1", "search the web for news")
+    assert state._retired_admission is not None
+    blocked = router.pre_tool_call(tool_name="kanban_sibling", session_id=agent.session_id, args={})
+    assert blocked and blocked["action"] == "block"
+
+
+def test_exact_narrowed_surface_is_restored_and_released(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent, state = _quarantined_agent(monkeypatch, "r8-exact")
+    _route(agent, "r8-e-1", "")
+    assert state._retired_admission is None
+    assert "kanban_show" in _rev6_names(agent)
+
+
+def test_abandoned_session_end_never_touches_a_reused_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "r8-end", config)
+    entered, release = _pause(monkeypatch, sys.modules[_TOOLS_MOD], "thaw_envelope_definitions")
+    monkeypatch.setattr(router, "_hook_commit_budget_s", lambda: 0.5)
+    replacement = [copy.deepcopy(agent.tools[0])]
+
+    def reuse() -> None:
+        import time as time_mod
+
+        time_mod.sleep(0.6)  # Hermes gives up on the teardown, then reuses
+        agent.session_id = "r8-end-new"
+        agent.tools = list(replacement)
+        agent.enabled_toolsets = ["web"]
+
+    _run_paused(lambda: router.on_session_end(session_id="r8-end", agent=agent), entered, release, reuse)
+    assert agent.tools == replacement and agent.enabled_toolsets == ["web"]
+
+
+def test_overlapping_post_tool_callbacks_recover_once_per_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    _registry, agent = _three_tool_agent(monkeypatch, "r8-latch")
+    _route(agent, "r8-latch-1", "search the web for news")
+    state = router._get_router_state(agent)
+    entered, release = _pause(monkeypatch, sys.modules[_TOOLS_MOD], "_registry_object", once=True)
+    _run_paused(
+        lambda: router.post_tool_call(agent=agent, session_id="r8-latch", tool_name="run_command", args={}),
+        entered,
+        release,
+        lambda: router.post_tool_call(agent=agent, session_id="r8-latch", tool_name="read_file", args={}),
+    )
+    names = _rev6_names(agent)
+    assert "read_file" in names and "run_command" not in names
+    assert state._retry_pending is True
+
+
+def test_stale_visible_request_reports_stale_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry, agent = _three_tool_agent(monkeypatch, "r8-stale", admit=False)
+    entered, release = _pause(monkeypatch, router, "_compose_effective_policy")
+    holder: dict[str, Any] = {}
+
+    def call() -> None:
+        holder["out"] = json.loads(
+            router.request_toolset_handler({"tool_name": "run_command"}, agent=agent, session_id="r8-stale")
+        )
+
+    _run_paused(
+        call,
+        entered,
+        release,
+        lambda: _end_and_reuse_file_only(agent, registry, "r8-stale", "r8-stale-new"),
+    )
+    assert holder["out"]["ok"] is False and holder["out"]["reason"] == "STALE_LIFECYCLE"
+    assert router._get_router_state(agent)._admission_session_id is None
+
+
+# --- Residual limits (round 9) and /router -------------------------------
+
+
+def test_expired_teardown_then_reuse_keeps_guard_and_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "r9-orphan", config)
+    state = router._get_router_state(agent)
+    monkeypatch.setattr(router, "_hook_commit_budget_s", lambda: -1.0)
+    router.on_session_end(session_id="r9-orphan", agent=agent)  # expires: no bookkeeping
+    assert state._retired_admission is None and state.surface_narrowed is True
+    monkeypatch.setattr(router, "_hook_commit_budget_s", lambda: 15.0)
+    agent.session_id = "r9-orphan-new"
+    blocked = router.pre_tool_call(tool_name="kanban_sibling", session_id="r9-orphan-new", args={})
+    assert blocked and blocked["action"] == "block"
+    # The unchanged narrowed surface is restored and the agent released.
+    _route(agent, "r9-o-1", "")
+    assert state._retired_admission is None
+    assert state.surface_narrowed is False
+    assert "kanban_show" in _rev6_names(agent)
+
+
+def test_expired_teardown_then_host_change_stays_quarantined(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    agent = _narrowed_protected_bridge_agent(monkeypatch, "r9-orphan2", config)
+    state = router._get_router_state(agent)
+    monkeypatch.setattr(router, "_hook_commit_budget_s", lambda: -1.0)
+    router.on_session_end(session_id="r9-orphan2", agent=agent)
+    monkeypatch.setattr(router, "_hook_commit_budget_s", lambda: 15.0)
+    agent.session_id = "r9-orphan2-new"
+    changed = list(agent.tools[:1])
+    agent.tools = changed
+    _route(agent, "r9-o2-1", "search the web for news")
+    assert agent.tools == changed
+    assert state._retired_admission is not None
+    blocked = router.pre_tool_call(tool_name="kanban_sibling", session_id="r9-orphan2-new", args={})
+    assert blocked and blocked["action"] == "block"
+
+
+def test_post_tool_expansion_claims_latch_inside_the_transaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    _registry, agent = _three_tool_agent(monkeypatch, "r9-claim")
+    _route(agent, "r9-claim-1", "search the web for news")
+    state = router._get_router_state(agent)
+    admission = state.bound_host_admission("r9-claim")
+    result = sys.modules[_TOOLS_MOD].expand_admitted_toolsets(
+        agent,
+        admission,
+        requested_toolsets=set(),
+        requested_tool_names={"run_command"},
+        caller="post_tool",
+        session_id="r9-claim",
+        claim_retry_for="run_command",
+    )
+    assert result.ok and state._retry_pending is True
+
+
+def test_session_end_releasing_old_quarantine_completes_its_own_teardown(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent, state = _quarantined_agent(monkeypatch, "r9-teardown")
+    router._store_agent_ref(agent, agent.session_id)
+    router.on_session_end(session_id=agent.session_id, agent=agent)
+    assert state._retired_admission is None
+    assert router._get_agent_ref(agent.session_id) is None
+
+
+def test_router_command_toggles_without_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(router, "_RUNTIME_OVERRIDE", None)
+    registry, agent = _three_tool_agent(monkeypatch, "r9-cmd")
+    _route(agent, "r9-cmd-1", "search the web for news")
+    state = router._get_router_state(agent)
+    assert state.surface_narrowed is True
+    assert "ON" in router.router_command("status")
+    assert "OFF" in router.router_command("off")
+    _route(agent, "r9-cmd-2", "next")
+    assert state.surface_narrowed is False
+    assert {"web_search", "read_file", "run_command"} <= set(_rev6_names(agent))
+    assert "OFF" in router.router_command("status")
+    # A fresh session routes again once switched back on.
+    router.router_command("on")
+    fresh = _rev6_agent(
+        registry, "r9-cmd-fresh", names=("web_search", "read_file", "run_command"), enabled=("web", "file", "terminal"),
+    )
+    assert _rev6_admit(fresh, monkeypatch, owned=False).status == "READY"
+    _route(fresh, "r9-cmd-3", "search the web for news")
+    assert router._get_router_state(fresh).surface_narrowed is True
+    assert "follows config.yaml" in router.router_command("reset")
+    assert router._RUNTIME_OVERRIDE is None
+    assert "Usage" in router.router_command("bogus")
+
+
+def test_router_command_registered_as_slash_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("_registration_checked", "_recovery_middleware_registered", "_recovery_tool_registered"):
+        monkeypatch.setattr(router, name, getattr(router, name))
+    recorded: dict[str, Any] = {}
+
+    class Ctx:
+        def register_hook(self, *a: Any, **k: Any) -> None: ...
+        def register_middleware(self, *a: Any, **k: Any) -> None: ...
+
+        def register_command(self, name: str, handler: Any, **kwargs: Any) -> None:
+            recorded[name] = (handler, kwargs)
+
+    router.register(Ctx())
+    assert "router" in recorded
+    assert recorded["router"][0] is router.router_command
+
+
+# --- Review round 10 amendments ------------------------------------------
+
+
+def test_env_kill_switch_beats_router_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(router, "_RUNTIME_OVERRIDE", None)
+    monkeypatch.setenv("HERMES_TOKEN_ROUTER_ENABLED", "0")
+    _registry, agent = _three_tool_agent(monkeypatch, "r10-env")
+    out = router.router_command("on")
+    assert "kill switch" in out and router._RUNTIME_OVERRIDE is None
+    monkeypatch.setattr(router, "_RUNTIME_OVERRIDE", True)  # even if set some other way
+    _route(agent, "r10-env-1", "search the web for news")
+    assert router._get_router_state(agent).surface_narrowed is False
+    assert "HERMES_TOKEN_ROUTER_ENABLED=off" in router.router_command("status")
+
+
+def test_router_on_uses_the_profiles_configured_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    disabled = {"global": {**_base_config(), "enabled": False, "floor_toolsets": ["terminal"]}}
+    monkeypatch.setattr(router, "_load_config", lambda: disabled)
+    monkeypatch.setenv("HERMES_PROFILE", "probe")
+    monkeypatch.delenv("HERMES_TOKEN_ROUTER_ENABLED", raising=False)
+    config_mod = sys.modules["hermes_token_router_plugin.config"]
+    monkeypatch.setattr(router, "_get_profile_config", config_mod._get_profile_config)
+    monkeypatch.setattr(router, "_RUNTIME_OVERRIDE", True)
+    agent = _rev6_agent(
+        registry, "r10-settings", names=("web_search", "read_file", "run_command"), enabled=("web", "file", "terminal"),
+    )
+    assert _rev6_admit(agent, monkeypatch, owned=False).status == "READY"
+    _route(agent, "r10-s-1", "search the web for news")
+    names = _rev6_names(agent)
+    assert "web_search" in names and "run_command" in names  # configured floor kept
+
+
+def test_router_status_reports_each_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(router, "_RUNTIME_OVERRIDE", None)
+    monkeypatch.delenv("HERMES_TOKEN_ROUTER_ENABLED", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "probe")
+    monkeypatch.setattr(router, "_load_config", lambda: {"global": {"enabled": True}})
+    assert "decided by config.yaml" in router.router_command("status")
+    monkeypatch.setenv("HERMES_TOKEN_ROUTER_ENABLED", "0")
+    status = router.router_command("status")
+    assert "OFF" in status and "config.yaml: on" in status and "environment: off" in status
+    monkeypatch.delenv("HERMES_TOKEN_ROUTER_ENABLED")
+    router.router_command("off")
+    status = router.router_command("status")
+    assert "decided by /router off" in status and "config.yaml: on" in status
+
+
+def test_overlapping_post_tool_at_return_boundary_recovers_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    _registry, agent = _three_tool_agent(monkeypatch, "r10-latch")
+    _route(agent, "r10-latch-1", "search the web for news")
+    state = router._get_router_state(agent)
+    real_expand = router.expand_admitted_toolsets
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def expand_then_pause(*args: Any, **kwargs: Any) -> Any:
+        result = real_expand(*args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            entered.set()  # committed, returned, latch handling not yet done before the fix
+            release.wait(5)
+        return result
+
+    monkeypatch.setattr(router, "expand_admitted_toolsets", expand_then_pause)
+    first = threading.Thread(
+        target=lambda: router.post_tool_call(agent=agent, session_id="r10-latch", tool_name="run_command", args={})
+    )
+    first.start()
+    assert entered.wait(5)
+    router.post_tool_call(agent=agent, session_id="r10-latch", tool_name="read_file", args={})
+    release.set()
+    first.join(5)
+    names = _rev6_names(agent)
+    assert "run_command" in names and "read_file" not in names
+    assert state._retry_pending is True
+
+
 _POLICY_MODULE = sys.modules[router._predict_toolsets_via_llm.__module__]
 
 
@@ -3035,7 +4470,12 @@ def test_positive_chinese_routing_is_deterministic_and_keeps_protected_capture(
             assert [item["function"]["name"] for item in agent.tools] == expected_names
             assert agent.valid_tool_names == set(expected_names)
             assert agent.enabled_toolsets == ["file", "kanban", "router_recovery"]
-            assert [registry.definitions[name] for name in expected_names] == agent.tools
+            # Ordinary/pinned definitions are byte-exact; request_toolset is the
+            # agent-local copy carrying the session capability catalog.
+            assert [registry.definitions[name] for name in expected_names[:-1]] == agent.tools[:-1]
+            recovery = agent.tools[-1]["function"]
+            assert recovery["name"] == "request_toolset"
+            assert "Capability catalog for this session" in recovery["description"]
             assert alias_calls == []
             assert client_calls == []
 

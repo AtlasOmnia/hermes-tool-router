@@ -6,13 +6,18 @@ The implementation lives in focused sibling modules.
 
 from __future__ import annotations
 
+import contextlib
 import difflib
 import json
 import logging
+import math
+import time
 from typing import Any, Dict, Optional, Set
 
 try:
     from .config import (
+        _env_override,
+        _get_profile_settings,
         CONFIG_FILE,
         DEFAULT_ROUTER_MODEL,
         DEFAULT_ROUTER_PROVIDER,
@@ -53,6 +58,8 @@ try:
         RouterState,
         _drop_agent_ref,
         _get_agent_from_stack,
+        _find_agent_in_threads,
+        _get_validated_agent_ref,
         _get_agent_ref,
         _get_router_state,
         _store_agent_ref,
@@ -63,26 +70,21 @@ try:
         RECOVERY_TOOLSET,
         RECOVERY_TOOLSET_CHOICES,
         build_recovery_tool_schema,
-        _apply_predicted_tools,
-        _cache_full_toolset,
-        _detect_missing_toolset,
-        _ensure_recovery_tool,
-        _expand_toolset,
         expand_admitted_toolsets,
-        _filter_tool_definitions,
         _get_agent_local_tool_names,
-        _get_all_tool_names,
         _get_recovery_tool_definition,
-        _get_tool_definitions_for_names,
-        _handle_full_fallback,
         _infer_toolset_from_tool,
         _resolve_toolset_to_tool_names,
-        _restore_full_tools,
+        commit_fence,
+        fenced_section,
         restore_admitted_envelope,
         select_and_commit_route,
+        surface_is_router_committed,
     )
 except ImportError:  # pragma: no cover - direct loader fallback
     from config import (
+        _env_override,
+        _get_profile_settings,
         CONFIG_FILE,
         DEFAULT_ROUTER_MODEL,
         DEFAULT_ROUTER_PROVIDER,
@@ -123,6 +125,8 @@ except ImportError:  # pragma: no cover - direct loader fallback
         RouterState,
         _drop_agent_ref,
         _get_agent_from_stack,
+        _find_agent_in_threads,
+        _get_validated_agent_ref,
         _get_agent_ref,
         _get_router_state,
         _store_agent_ref,
@@ -133,23 +137,16 @@ except ImportError:  # pragma: no cover - direct loader fallback
         RECOVERY_TOOLSET,
         RECOVERY_TOOLSET_CHOICES,
         build_recovery_tool_schema,
-        _apply_predicted_tools,
-        _cache_full_toolset,
-        _detect_missing_toolset,
-        _ensure_recovery_tool,
-        _expand_toolset,
         expand_admitted_toolsets,
-        _filter_tool_definitions,
         _get_agent_local_tool_names,
-        _get_all_tool_names,
         _get_recovery_tool_definition,
-        _get_tool_definitions_for_names,
-        _handle_full_fallback,
         _infer_toolset_from_tool,
         _resolve_toolset_to_tool_names,
-        _restore_full_tools,
+        commit_fence,
+        fenced_section,
         restore_admitted_envelope,
         select_and_commit_route,
+        surface_is_router_committed,
     )
 
 logger = logging.getLogger(__name__)
@@ -175,6 +172,79 @@ def _mark_turn_routed(agent: Any, state: RouterState, turn_id: str, source: str)
     """Record that this agent/turn already passed through the router."""
     if not turn_id:
         return
+    with fenced_section() as may_commit:
+        if may_commit:
+            _mark_turn_routed_locked(agent, state, turn_id, source)
+
+
+class _HookFence:
+    """Lifecycle token for one hook or tool-handler invocation.
+
+    ``still_valid`` holds while the lifecycle generation is unchanged, the
+    agent still carries the hook's session id, the bound admission slot is the
+    one this hook saw (once it pinned it) and the deadline has not passed.
+    """
+
+    def __init__(
+        self,
+        agent: Any,
+        state: RouterState,
+        session_id: str,
+        deadline: float,
+        require_retry_available: bool = False,
+    ) -> None:
+        self.require_retry_available = require_retry_available
+        self.agent = agent
+        self.state = state
+        self.session_id = session_id
+        self.deadline = deadline
+        self.generation = state.lifecycle_generation
+        self.slot: tuple[Any, int] | None = None
+
+    def pin_admission(self) -> None:
+        self.slot = _admission_slot(self.state)
+
+    def rebase(self) -> None:
+        """Adopt the lifecycle this hook itself just started (retirement release)."""
+        self.generation = self.state.lifecycle_generation
+        self.slot = None
+
+    def still_valid(self) -> bool:
+        return (
+            self.state.lifecycle_generation == self.generation
+            and _agent_session_matches_id(self.agent, self.session_id)
+            and (self.slot is None or _admission_slot(self.state) == self.slot)
+            and time.monotonic() <= self.deadline
+            and not (self.require_retry_available and self.state._retry_pending)
+        )
+
+
+@contextlib.contextmanager
+def _hook_fence(
+    agent: Any, session_id: str, *, deadline: float = math.inf, require_retry_available: bool = False
+):
+    state = _get_router_state(agent)
+    fence = _HookFence(agent, state, session_id, deadline, require_retry_available)
+    with commit_fence(state.mutation_lock, fence.still_valid):
+        yield fence
+
+
+def _admission_slot(state: RouterState) -> tuple[Any, int]:
+    """Identity of the bound admission (session id + result object)."""
+    return (
+        getattr(state, "_admission_session_id", None),
+        id(getattr(state, "_bound_admission_result", None)),
+    )
+
+
+def _set_inactive(state: RouterState) -> None:
+    with fenced_section() as may_commit:
+        if may_commit:
+            state.active = False
+            state.predicted_toolsets = None
+
+
+def _mark_turn_routed_locked(agent: Any, state: RouterState, turn_id: str, source: str) -> None:
     state.routed_turn_id = turn_id
     state.routed_source = source
     try:
@@ -192,359 +262,163 @@ def _was_turn_routed(agent: Any, state: RouterState, turn_id: str) -> bool:
     return getattr(agent, "_token_router_early_hook_turn_id", None) == turn_id
 
 
-def _route_tool_surface(source: str, agent: Any = None, **kwargs: Any) -> Optional[Dict[str, Any]]:
-    """Predict relevant toolsets and narrow the live agent tool surface."""
-    cfg = _load_config()
-    if not _is_router_active(cfg):
-        if agent is None:
-            agent = _get_agent_ref()
-        if agent is not None:
-            _get_router_state(agent).reset()
-        return None
-
-    user_message = kwargs.get("user_message", "")
-    if not user_message:
-        return None
-
-    session_id = str(kwargs.get("session_id") or getattr(agent, "session_id", "") or "")
-    if agent is not None:
-        _store_agent_ref(agent, session_id)
-    else:
-        # The current hook stack is authoritative; a cached session mapping can
-        # be stale after resets or test/profile reloads.
-        agent = _get_agent_from_stack() or _get_agent_ref(session_id)
-        if agent is not None:
-            session_id = session_id or str(getattr(agent, "session_id", "") or "")
-            _store_agent_ref(agent, session_id)
-            logger.info("%s: acquired agent reference for compatibility hook", PLUGIN_NAME)
-        else:
-            logger.warning("%s: no agent reference; full set fallback", PLUGIN_NAME)
-            return None
-
-    turn_id = kwargs.get("turn_id") or getattr(agent, "_current_turn_id", "") or ""
-    state = _get_router_state(agent)
-
-    if not _recovery_is_ready():
-        _restore_full_tools(agent)
-        state.active = False
-        state.predicted_toolsets = None
-        logger.warning(
-            "%s: recovery registration incomplete; keeping full tool surface",
-            PLUGIN_NAME,
-        )
-        return None
-
-    # Production policy: classify only the initial tool surface. Later turns
-    # reuse the session-sticky surface so tool schemas remain cache-stable.
-    if state.initial_route_applied:
-        if turn_id:
-            _mark_turn_routed(agent, state, turn_id, "sticky_surface")
-        return None
-
-    if source != "pre_turn_context_build" and _was_turn_routed(agent, state, turn_id):
-        logger.debug("%s: skipping duplicate late pre_llm_call for early-routed turn", PLUGIN_NAME)
-        return None
-
-    def complete() -> None:
-        if source == "pre_turn_context_build":
-            _mark_turn_routed(agent, state, turn_id, source)
-        return None
-
-    # Get profile config
-    profile_cfg = _get_profile_config(cfg)
-    if not profile_cfg.get("enabled", False):
-        return complete()
-
-    decline_chars = profile_cfg.get("long_message_decline_chars", 2000)
-    short_bypass_chars = profile_cfg.get("short_message_bypass_chars", 0)
-    floor_toolsets = set(profile_cfg.get("floor_toolsets", ["terminal", "file", "web"]))
-    confidence_threshold = float(profile_cfg.get("confidence_threshold", 0.0))
-    router_model = _get_router_model(profile_cfg)
-    router_provider = _get_router_provider(profile_cfg)
-    classifier_base_url, classifier_api_key_env = _get_classifier_connection(profile_cfg)
-    state.router_model = router_model
-
-    profile_name = profile_cfg.get("_profile_name", "unknown")
-    logger.debug(
-        "%s: predicting for profile=%s using model=%s, message_len=%d",
-        PLUGIN_NAME,
-        profile_name,
-        router_model,
-        len(user_message),
-    )
-
-    # Cache the current full tool definitions before we modify anything
-    _cache_full_toolset(agent)
-
-    # Bypass for long/complex messages; don't risk missing a tool
-    if len(user_message) > decline_chars:
-        logger.debug(
-            "%s: bypass reduction (message too long: %d chars > %d)",
-            PLUGIN_NAME, len(user_message), decline_chars,
-        )
-        _restore_full_tools(agent)
-        state.active = False
-        state.predicted_toolsets = None
-        return complete()
-
-    # Bypass for very short or ambiguous messages; only if threshold > 0
-    if short_bypass_chars > 0 and len(user_message.strip()) < short_bypass_chars:
-        logger.debug(
-            "%s: bypass reduction (message too short: %d chars < %d)",
-            PLUGIN_NAME, len(user_message.strip()), short_bypass_chars,
-        )
-        _restore_full_tools(agent)
-        state.active = False
-        state.predicted_toolsets = None
-        return complete()
-
-    # Get available toolsets
-    try:
-        available = _get_available_toolsets()
-    except Exception:
-        logger.warning(
-            "%s: could not list toolsets; full set fallback",
-            PLUGIN_NAME,
-        )
-        _restore_full_tools(agent)
-        state.active = False
-        state.predicted_toolsets = None
-        return complete()
-
-    if not available:
-        return complete()
-
-    predicted: Optional[Set[str]]
-    deterministic_enabled = bool(profile_cfg.get("deterministic_rules_enabled", True))
-    rule_reason = "disabled"
-    # Empty and period/ellipsis-only probes carry no actionable intent. Route
-    # them deterministically even on classifier-first profiles: asking a
-    # stochastic model to interpret "." can yield a low-confidence "all"
-    # response, and the safe fail-open then defeats the smallest-surface smoke
-    # test. Other symbols and emoji remain ambiguous and keep the normal
-    # classifier/fail-open path.
-    probe_chars = {char for char in user_message if not char.isspace()}
-    if not probe_chars or probe_chars <= {".", "…"}:
-        predicted = set()
-        rule_reason = "empty_or_period_probe"
-    elif deterministic_enabled:
-        predicted, rule_reason = _predict_toolsets_by_rules(user_message, available)
-    else:
-        predicted = None
-
-    if predicted is not None:
-        logger.info(
-            "%s: deterministic route reason=%s predicted_toolsets=%s",
-            PLUGIN_NAME,
-            rule_reason,
-            sorted(predicted),
-        )
-    else:
-        # The external classifier is opt-in. An unresolved deterministic route
-        # fails open immediately when it is disabled—zero network latency.
-        if not _is_classifier_enabled(profile_cfg):
-            predicted = None
-        else:
-            try:
-                predicted = _predict_toolsets_via_llm(
-                    user_message,
-                    available,
-                    router_model,
-                    confidence_threshold,
-                    router_provider,
-                    max(0.05, float(profile_cfg.get("router_hard_timeout_ms", 1200)) / 1000.0),
-                    classifier_base_url,
-                    classifier_api_key_env,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "%s: prediction failed: %s; full set fallback",
-                    PLUGIN_NAME, exc,
-                )
-                _restore_full_tools(agent)
-                state.active = False
-                state.predicted_toolsets = None
-                return complete()
-
-    if predicted is None:
-        # Bypass; keep full toolsets
-        _restore_full_tools(agent)
-        state.active = False
-        state.predicted_toolsets = None
-        logger.debug("%s: bypass; keeping full toolset", PLUGIN_NAME)
-        logger.debug(
-            "%s: predicted toolsets bypassed for profile=%s",
-            PLUGIN_NAME,
-            profile_name,
-        )
-        return complete()
-
-    # Log prediction
-    logger.debug(
-        "%s: predicted_toolsets=%s",
-        PLUGIN_NAME,
-        sorted(predicted),
-    )
-
-    # Filter agent.tools to only the predicted toolsets
-    try:
-        _apply_predicted_tools(agent, predicted, available)
-    except Exception as exc:
-        logger.warning(
-            "%s: failed to apply predicted tools: %s; full set fallback",
-            PLUGIN_NAME, exc,
-        )
-        _restore_full_tools(agent)
-        state.active = False
-        state.predicted_toolsets = None
-        return complete()
-
-    # Store agent-scoped state for post_tool_call/request_toolset.
-    state.active = True
-    state.predicted_toolsets = predicted
-    state.set_initial_surface(set(predicted) | floor_toolsets)
-    state._fallback_triggered = False
-    state._retry_pending = False
-
-    total_tools = len(agent.tools) if hasattr(agent, "tools") and agent.tools else 0
-    logger.info(
-        "%s: narrowed to %d toolsets: %s (%d tools)",
-        PLUGIN_NAME,
-        len(predicted),
-        sorted(predicted),
-        total_tools,
-    )
-    return complete()
-
-
-def _legacy_request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
-    """Expand the live agent with one requested toolset."""
-    requested_toolset = str(args.get("toolset") or args.get("toolset_name") or "").strip().lower()
-    raw_toolsets = args.get("toolsets") or []
-    requested_toolsets = {
-        str(name).strip().lower() for name in raw_toolsets if str(name).strip()
-    } if isinstance(raw_toolsets, list) else set()
-    if requested_toolset:
-        requested_toolsets.add(requested_toolset)
-    requested_tool = str(args.get("tool_name") or "").strip()
-    reason = str(args.get("reason") or "").strip()[:200]
-
-    try:
-        from tools.registry import registry
-        available = set(registry.get_registered_toolset_names())
-        if requested_tool:
-            owner = _infer_toolset_from_tool(requested_tool, registry)
-            if owner:
-                requested_toolsets.add(owner)
-        requested_toolsets = {
-            registry.get_toolset_alias_target(name) or name for name in requested_toolsets
-        }
-    except Exception:
-        available = set()
-
-    if not requested_toolsets:
-        return json.dumps({
-            "ok": False,
-            "error": "toolsets or resolvable tool_name is required",
-            "requested_toolsets": [],
-            "requested_tool": requested_tool,
-        })
-
-    unknown = requested_toolsets - available if available else set()
-    if unknown:
-        bad = sorted(unknown)[0]
-        suggestions = difflib.get_close_matches(bad, sorted(available), n=5)
-        return json.dumps({
-            "ok": False,
-            "error": f"unknown toolset: {bad}",
-            "requested_toolsets": sorted(requested_toolsets),
-            "requested_tool": requested_tool,
-            "suggestions": suggestions,
-            "available_toolsets": sorted(available),
-        })
-
-    session_id = str(kwargs.get("session_id") or "")
-    agent = _get_agent_ref(session_id) or _get_agent_from_stack()
-    if agent is None:
-        return json.dumps({
-            "ok": False,
-            "error": "no live agent reference",
-            "requested_toolsets": sorted(requested_toolsets),
-            "requested_tool": requested_tool,
-        })
-
-    state = _get_router_state(agent)
-    if state._full_tool_defs is None:
-        _cache_full_toolset(agent)
-    for toolset_name in sorted(requested_toolsets):
-        _expand_toolset(agent, toolset_name)
-    _ensure_recovery_tool(agent)
-    state.active = True
-    state._retry_pending = False
-
-    enabled_tools = sorted(getattr(agent, "valid_tool_names", set()) or set())
-    response = {
-        "ok": True,
-        "toolsets": sorted(requested_toolsets),
-        "requested_tool": requested_tool,
-        "reason": reason,
-        "enabled_tools": enabled_tools,
-    }
-    if len(requested_toolsets) == 1:
-        response["toolset"] = next(iter(requested_toolsets))
-    return json.dumps(response)
-
-
-def _legacy_tool_request_middleware(**kwargs: Any) -> Optional[Dict[str, Any]]:
-    """Expand a registry-known pruned tool before Hermes validates/dispatches it.
-
-    Hermes applies ``tool_request`` middleware before it passes the current
-    ``valid_tool_names`` set into normal dispatch. Updating the agent here lets
-    the original call continue through ordinary check_fn, approvals, and
-    execution without an invalid-tool round trip.
-    """
-    session_id = str(kwargs.get("session_id") or "")
-    tool_name = str(kwargs.get("tool_name") or "").strip()
-    args = kwargs.get("args")
-    if not tool_name or not isinstance(args, dict):
-        return None
-    agent = _get_agent_ref(session_id)
-    if agent is None:
-        return None
-    state = _get_router_state(agent)
-    if not state.active or tool_name in (getattr(agent, "valid_tool_names", set()) or set()):
-        return None
-    try:
-        from tools.registry import registry
-        toolset_name = _infer_toolset_from_tool(tool_name, registry)
-    except Exception:
-        toolset_name = None
-    if not toolset_name:
-        return None
-    _expand_toolset(agent, toolset_name)
-    if tool_name not in (getattr(agent, "valid_tool_names", set()) or set()):
-        return None
-    logger.info(
-        "%s: middleware recovery added toolset=%s for tool=%s session=%s",
-        PLUGIN_NAME,
-        toolset_name,
-        tool_name,
-        session_id,
-    )
-    return {"args": dict(args), "router_recovered": toolset_name}
-
-
 def on_session_end(**kwargs: Any) -> None:
     session_id = str(kwargs.get("session_id") or "")
     agent = kwargs.get("agent")
     if agent is None and session_id:
         agent = _get_agent_ref(session_id)
+    if session_id and agent is not None and not _agent_session_matches_id(agent, session_id):
+        # Never tear down another session's agent.
+        agent = None
+    restored = True
     if session_id and agent is not None:
         state = _attached_capability_state(agent)
         if state is not None:
-            state.end_admission(session_id)
-    if session_id:
+            with _hook_fence(
+                agent, session_id, deadline=time.monotonic() + _hook_commit_budget_s()
+            ) as fence:
+                restored = _end_session_fenced(agent, state, session_id, fence)
+    if session_id and restored:
         _drop_agent_ref(session_id)
+
+
+def _end_session_fenced(
+    agent: Any, state: RouterState, session_id: str, fence: _HookFence | None = None
+) -> bool:
+    """Session-end teardown; an abandoned teardown never touches a new lifecycle."""
+    if not _retry_retired_restore(agent, state, session_id, fence):
+        # An older session on this agent is still unrestored: this session
+        # never routed (quarantine), so there is nothing to undo.
+        return True
+    restored = True
+    if getattr(state, "surface_narrowed", False):
+        bound = state.bound_host_admission(session_id)
+        restored = bool(
+            bound is not None
+            and bound.envelope is not None
+            and bound.status in {"READY", "SAFE_NO_PRUNE"}
+            and restore_admitted_envelope(agent, bound)
+        )
+    with fenced_section() as may_commit:
+        if not may_commit:
+            # Abandoned or superseded teardown: leave whatever lifecycle is
+            # current untouched (a later session end retries).
+            return False
+        if restored:
+            # Retire the lifecycle; a reused agent object starts its next
+            # session fresh, and in-flight hooks from this session can no
+            # longer commit (generation bump).
+            state.end_admission(session_id)
+            state.reset()
+            return True
+        bound = state.bound_host_admission(session_id)
+        # Keep the admission, the narrowed markers and the agent reference:
+        # the protected-tool guard stays engaged and a later disabled turn or
+        # session end can retry the restore.  A reused agent stays
+        # quarantined under this admission (_retry_retired_restore).
+        state._retired_admission = (session_id, bound) if bound is not None else None
+        # Revoke this session's in-flight hooks even though the admission is
+        # kept for enforcement and retry.
+        state.lifecycle_generation += 1
+        logger.warning(
+            "%s: could not restore the narrowed surface at session end for %s; "
+            "keeping its admission so enforcement and retry remain possible",
+            PLUGIN_NAME,
+            session_id,
+        )
+        return False
+
+
+# Process-wide switch set by /router.  None = follow config.yaml (and the
+# HERMES_TOKEN_ROUTER_ENABLED environment override).
+_RUNTIME_OVERRIDE: bool | None = None
+
+
+def _config_enabled(cfg: Any) -> bool:
+    return bool(_is_router_active(cfg) and _get_profile_config(cfg).get("enabled", False))
+
+
+def _router_enabled(cfg: Any) -> bool:
+    """Precedence: HERMES_TOKEN_ROUTER_ENABLED=off (kill switch) > /router > config."""
+    if _env_override() is False:
+        return False
+    runtime = _RUNTIME_OVERRIDE
+    if runtime is not None:
+        return runtime
+    return _config_enabled(cfg)
+
+
+def _routing_settings(cfg: Any) -> dict[str, Any]:
+    """Profile routing settings, independent of whether config enables routing."""
+    return _get_profile_settings(cfg)
+
+
+_ROUTER_HELP = (
+    "Usage: /router on | off | status | reset\n"
+    "  off    stop routing now; a narrowed session gets its full tool list back on the next turn\n"
+    "  on     route new sessions (and sessions not yet routed) from the next turn\n"
+    "  reset  follow the plugin's config.yaml again\n"
+    "  status show the current state\n"
+    "Applies to this Hermes process until it restarts; config.yaml is not changed."
+)
+
+
+def router_command(raw_args: str = "") -> str:
+    """Slash command handler: no model call, no core change."""
+    global _RUNTIME_OVERRIDE
+    arg = (raw_args or "").strip().lower()
+    if arg in {"", "status"}:
+        return _router_status_text()
+    if arg in {"help", "-h", "--help"}:
+        return _ROUTER_HELP
+    if arg in {"off", "disable", "0", "false"}:
+        _RUNTIME_OVERRIDE = False
+        return (
+            "Tool router OFF for this Hermes process. Sessions it narrowed get their full "
+            "tool list back on the next turn. config.yaml is unchanged; /router reset to follow it."
+        )
+    if arg in {"on", "enable", "1", "true"}:
+        if _env_override() is False:
+            return (
+                "Not turned on: HERMES_TOKEN_ROUTER_ENABLED is set to off for this process, "
+                "and that kill switch takes precedence over /router."
+            )
+        _RUNTIME_OVERRIDE = True
+        return (
+            "Tool router ON for this Hermes process from the next turn (a session that was "
+            "already restored to the full list stays full). config.yaml is unchanged."
+        )
+    if arg in {"reset", "default", "config"}:
+        _RUNTIME_OVERRIDE = None
+        return "Tool router follows config.yaml again. " + _router_status_text()
+    return f"Unknown option: {arg}\n\n{_ROUTER_HELP}"
+
+
+def _router_status_text() -> str:
+    runtime = _RUNTIME_OVERRIDE  # one snapshot for the whole message
+    try:
+        cfg = _load_config()
+        settings = _get_profile_settings(cfg)
+        configured = bool(settings.get("enabled", False))
+        profile = settings.get("_profile_name", "unknown")
+        effective = _router_enabled(cfg) if runtime is _RUNTIME_OVERRIDE else bool(runtime)
+    except Exception:  # noqa: BLE001 - status must never fail
+        configured, profile, effective = False, "unknown", False
+    env = _env_override()
+    if env is False:
+        source = "HERMES_TOKEN_ROUTER_ENABLED=off (kill switch; /router on cannot override it)"
+    elif runtime is not None:
+        source = f"/router {'on' if runtime else 'off'}"
+    elif env is True:
+        source = "HERMES_TOKEN_ROUTER_ENABLED=on together with config.yaml"
+    else:
+        source = "config.yaml"
+    return (
+        f"Tool router is {'ON' if effective else 'OFF'} for this process (decided by {source}). "
+        f"config.yaml: {'on' if configured else 'off'} for profile {profile}; "
+        f"environment: {'unset' if env is None else ('on' if env else 'off')}; "
+        f"/router: {'not set' if runtime is None else ('on' if runtime else 'off')}."
+    )
 
 
 def register(ctx) -> None:
@@ -570,7 +444,19 @@ def register(ctx) -> None:
 
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("post_tool_call", post_tool_call)
+    ctx.register_hook("pre_tool_call", pre_tool_call)
     ctx.register_hook("on_session_end", on_session_end)
+    try:
+        # /router on|off|status: handled by Hermes's slash-command dispatch,
+        # never sent to the model.
+        ctx.register_command(
+            "router",
+            handler=router_command,
+            description="Turn the tool router on or off for this Hermes process (no model call).",
+            args_hint="on|off|status",
+        )
+    except Exception as exc:  # noqa: BLE001 - older hosts lack register_command
+        logger.debug("%s: /router command unavailable: %s", PLUGIN_NAME, exc)
     try:
         ctx.register_middleware("tool_request", tool_request_middleware)
         _recovery_middleware_registered = True
@@ -610,101 +496,6 @@ def pre_turn_context_build(**kwargs: Any) -> Optional[Dict[str, Any]]:
 def pre_llm_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
     """Late fallback hook for older Hermes builds or missed early hooks."""
     return _route_tool_surface("pre_llm_call", **kwargs)
-
-def _legacy_post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
-    """Post-tool hook: detect missing tools and expand agent.tools dynamically.
-
-    If a tool was called that isn't in our predicted set, we:
-    1. Find the toolset it belongs to
-    2. Add that toolset's tools to agent.tools
-    3. Update agent.enabled_toolsets
-    4. Set _retry_pending flag so the conversation loop retries this turn
-
-    Returns None (observer hook, no return value consumed by caller).
-    """
-
-    session_id = str(kwargs.get("session_id") or "")
-    agent = _get_agent_ref(session_id) or _get_agent_from_stack()
-    if agent is None:
-        return None
-    state = _get_router_state(agent)
-
-    if not state.active:
-        return None
-
-    # Check if we already expanded — skip repeated expansions for the same turn
-    if state._retry_pending:
-        return None
-
-    tool_name = kwargs.get("tool_name", "")
-    if not tool_name:
-        return None
-
-    try:
-        # Check if this tool is already in the current tool set
-        if hasattr(agent, "valid_tool_names"):
-            if tool_name in agent.valid_tool_names:
-                return None  # Tool is already loaded
-
-        # Check if the tool is not available at all
-        all_tool_names = _get_all_tool_names()
-        if tool_name not in all_tool_names:
-            logger.debug(
-                "%s: tool '%s' not found in registry at all — skipping",
-                PLUGIN_NAME, tool_name,
-            )
-            return None
-
-        # Find which toolset this tool belongs to
-        from tools.registry import registry
-        missing_toolset = _infer_toolset_from_tool(tool_name, registry)
-
-        if missing_toolset is None:
-            logger.debug(
-                "%s: could not determine toolset for '%s' — full fallback",
-                PLUGIN_NAME, tool_name,
-            )
-            _handle_full_fallback(agent)
-            return None
-
-        # If this toolset is already in the predicted set, something else
-        # is wrong — don't expand.
-        if (state.predicted_toolsets is not None
-                and missing_toolset in state.predicted_toolsets):
-            logger.debug(
-                "%s: tool '%s' in toolset '%s' but not in valid_tool_names — "
-                "likely a check_fn issue, not router",
-                PLUGIN_NAME, tool_name, missing_toolset,
-            )
-            # Still expand since the tool isn't available
-            _expand_toolset(agent, missing_toolset)
-        else:
-            # Expand the predicted set with the missing toolset
-            _expand_toolset(agent, missing_toolset)
-
-        # Signal retry by setting the flag — the agent loop will re-read
-        # agent.tools before the next API call
-        state._retry_pending = True
-
-        logger.info(
-            "%s: recall — added toolset '%s' (tool '%s' not in predicted set %s). "
-            "%d tools now available.",
-            PLUGIN_NAME,
-            missing_toolset,
-            tool_name,
-            sorted(state.predicted_toolsets) if state.predicted_toolsets else "N/A",
-            len(agent.tools) if hasattr(agent, "tools") and agent.tools else 0,
-        )
-
-    except Exception as exc:
-        logger.warning(
-            "%s: post_tool_call handler failed: %s — full fallback",
-            PLUGIN_NAME, exc,
-        )
-        _handle_full_fallback(agent)
-
-    return None
-
 
 _cfg = _load_config() if CONFIG_FILE.exists() else {}
 _prof_cfg = _get_profile_config(_cfg)
@@ -922,7 +713,8 @@ def _ensure_host_admission(
             dispatcher_owned_worker=dispatcher_owned,
             worker_identity_error=worker_error,
         )
-        return state.ensure_host_admission(
+        return _bind_admission(
+            state,
             session_id=session_id,
             untouched_surface=untouched_surface,
             original_enabled_toolsets=original_enabled_toolsets,
@@ -940,13 +732,28 @@ def _ensure_host_admission(
         dispatcher_owned_worker=None,
         worker_identity_error=None,
     )
-    return state.ensure_host_admission(
+    return _bind_admission(
+        state,
         session_id=session_id,
         untouched_surface=MISSING,
         original_enabled_toolsets=MISSING,
         effective_policy=effective_policy,
         owner_snapshot=MISSING,
     )
+
+
+def _bind_admission(state: RouterState, *, session_id: str, **prepared: Any) -> EnsureAdmissionResult:
+    """Bind prepared admission atomically; a stale hook never reserves a slot.
+
+    Owner snapshot and policy composition (registry work) are prepared by the
+    caller outside the lock; only this binding step is serialized.
+    """
+    with fenced_section() as may_commit:
+        if not may_commit:
+            return result_for_status(
+                "SESSION_MISMATCH", session_id, diagnostics=("STALE_LIFECYCLE",)
+            )
+        return state.ensure_host_admission(session_id=session_id, **prepared)
 
 
 def _route_tool_surface(
@@ -956,11 +763,28 @@ def _route_tool_surface(
     **kwargs: Any,
 ) -> Optional[Dict[str, Any]]:
     """Capture admission before empty-message exits, then route one surface."""
+    # Hermes's abandonment clock is already running; everything below counts.
+    route_started = time.monotonic()
     cfg = _load_config()
     if agent is None:
-        agent = _get_agent_from_stack() or _get_agent_ref(
-            str(kwargs.get("session_id") or "") or None
-        )
+        # Same order as before for inline hooks (own stack, then the stored
+        # session ref); current Hermes runs pre_llm_call on a timeout worker
+        # thread, so finally search the other threads by exact session id.
+        # Every candidate must carry the hook's exact session id.
+        hook_session_id = str(kwargs.get("session_id") or "") or None
+        if hook_session_id:
+            agent = (
+                _get_agent_from_stack(hook_session_id, scan_threads=False)
+                or _get_validated_agent_ref(hook_session_id)
+                or _find_agent_in_threads(hook_session_id)
+            )
+        else:
+            agent = _get_agent_from_stack() or _get_agent_ref(None)
+    elif kwargs.get("session_id") and not _agent_session_matches_id(
+        agent, str(kwargs.get("session_id"))
+    ):
+        # An explicit agent from another session is never routed or cached.
+        return None
     session_id = str(kwargs.get("session_id") or getattr(agent, "session_id", "") or "")
     if agent is not None:
         _store_agent_ref(agent, session_id)
@@ -968,6 +792,55 @@ def _route_tool_surface(
         return None
 
     state = _get_router_state(agent)
+    with _hook_fence(agent, session_id, deadline=route_started + _hook_commit_budget_s()) as fence:
+        if not _retry_retired_restore(agent, state, session_id, fence):
+            # A previous session on this agent could not be restored; keep the
+            # surface and the guard as they are until that restore succeeds.
+            return None
+        return _route_fenced(source, agent, cfg, state, session_id, fence, kwargs)
+
+
+def _route_fenced(
+    source: str,
+    agent: Any,
+    cfg: Any,
+    state: RouterState,
+    session_id: str,
+    fence: _HookFence,
+    kwargs: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Route body; every mutation below is checked against the hook's fence."""
+    if not _router_enabled(cfg):
+        # A disabled router must not touch a surface it never narrowed:
+        # no capture, no restore (hosts add tools mid-session).  If it did
+        # narrow earlier in this session, restore the exact envelope once.
+        # The flag is cleared only by a successful restore (inside
+        # restore_admitted_envelope), so a failed or impossible restore keeps
+        # the protected-tool guard engaged and is retried next turn.
+        if getattr(state, "surface_narrowed", False):
+            bound = state.bound_host_admission(session_id)
+            restored = False
+            if (
+                bound is not None
+                and bound.status in {"READY", "SAFE_NO_PRUNE"}
+                and bound.envelope is not None
+            ):
+                restored = bool(restore_admitted_envelope(agent, bound))
+            with fenced_section() as may_commit:
+                if (
+                    may_commit
+                    and not restored
+                    and getattr(state, "_restore_warned_session", None) != session_id
+                ):
+                    state._restore_warned_session = session_id
+                    logger.warning(
+                        "%s: router disabled but the narrowed surface could not be restored "
+                        "for session %s; will retry every turn",
+                        PLUGIN_NAME,
+                        session_id,
+                    )
+        _set_inactive(state)
+        return None
     marker = state.no_authority_contamination(session_id)
     first_contact = not state.initial_route_applied and marker is None
     hook_metadata = kwargs.get("hermes_token_router_admission", MISSING)
@@ -981,6 +854,8 @@ def _route_tool_surface(
     else:
         untouched_surface = MISSING
         original_enabled = MISSING
+    # Preparation (registry ownership, policy) runs unlocked; only the
+    # binding is fenced, so a stale hook never reserves a session slot.
     admission = _ensure_host_admission(
         source=source,
         agent=agent,
@@ -990,18 +865,12 @@ def _route_tool_surface(
         hook_metadata=hook_metadata,
         agent_metadata=agent_metadata,
     )
+    if "STALE_LIFECYCLE" in tuple(getattr(admission, "diagnostics", ()) or ()):
+        return None
+    fence.pin_admission()
 
     user_message = kwargs.get("user_message", "")
     turn_id = kwargs.get("turn_id") or getattr(agent, "_current_turn_id", "") or ""
-    current_profile_cfg = _get_profile_config(cfg)
-    if not _is_router_active(cfg) or not current_profile_cfg.get("enabled", False):
-        if admission.status in {"READY", "SAFE_NO_PRUNE"} and admission.envelope is not None:
-            restore_admitted_envelope(agent, admission)
-        state.active = False
-        state.predicted_toolsets = None
-        if source == "pre_turn_context_build":
-            _mark_turn_routed(agent, state, turn_id, source)
-        return None
     if not user_message:
         # Admission is intentionally bound before this return.  Do not run
         # classifier, available-toolset, retrieval, recovery, or retry work.
@@ -1009,15 +878,22 @@ def _route_tool_surface(
     if not _recovery_is_ready():
         # The target runtime must retain its current surface until both
         # recovery mechanisms are registered successfully.
-        state.active = False
-        state.predicted_toolsets = None
+        _set_inactive(state)
         if source == "pre_turn_context_build":
             _mark_turn_routed(agent, state, turn_id, source)
         return None
     if state.initial_route_applied:
         turn_id = kwargs.get("turn_id") or getattr(agent, "_current_turn_id", "") or ""
-        if turn_id:
-            _mark_turn_routed(agent, state, turn_id, "sticky_surface")
+        with fenced_section() as may_commit:
+            if not may_commit:
+                return None
+            # post_tool_call recovery may fire once per turn: reset the latch
+            # only on a genuine turn transition (or when turns are unknown).
+            if not turn_id or turn_id != getattr(state, "_retry_turn_id", None):
+                state._retry_pending = False
+                state._retry_turn_id = turn_id or None
+            if turn_id:
+                _mark_turn_routed(agent, state, turn_id, "sticky_surface")
         return None
     turn_id = kwargs.get("turn_id") or getattr(agent, "_current_turn_id", "") or ""
     if source != "pre_turn_context_build" and _was_turn_routed(agent, state, turn_id):
@@ -1029,29 +905,23 @@ def _route_tool_surface(
             _mark_turn_routed(agent, state, turn_id, source)
         return None
 
-    profile_cfg = _get_profile_config(cfg)
-    if not profile_cfg.get("enabled", False):
-        if admission.status in {"READY", "SAFE_NO_PRUNE"} and admission.envelope is not None:
-            restore_admitted_envelope(agent, admission)
-        state.active = False
-        state.predicted_toolsets = None
-        if source == "pre_turn_context_build":
-            _mark_turn_routed(agent, state, turn_id, source)
-        return None
+    # Enablement (config, environment, /router) was decided at the top of
+    # this route; settings apply whether or not config.yaml enables routing.
+    profile_cfg = _routing_settings(cfg)
     if admission.status != "READY":
         # SAFE_NO_PRUNE restores only its already captured envelope.  All
         # other statuses preserve the current surface and deny additions.
         if admission.status == "SAFE_NO_PRUNE" and admission.envelope is not None:
             restore_admitted_envelope(agent, admission)
-        state.active = False
-        state.predicted_toolsets = None
+        _set_inactive(state)
         if source == "pre_turn_context_build":
             _mark_turn_routed(agent, state, turn_id, source)
         return None
 
     decline_chars = profile_cfg.get("long_message_decline_chars", 2000)
     short_bypass_chars = profile_cfg.get("short_message_bypass_chars", 0)
-    floor_toolsets = set(profile_cfg.get("floor_toolsets", ["terminal", "file", "web"]))
+    # Same default as the shipped config.yaml: no floor unless configured.
+    floor_toolsets = set(profile_cfg.get("floor_toolsets", []) or [])
     try:
         available = _get_available_toolsets()
     except Exception:
@@ -1104,6 +974,8 @@ def _route_tool_surface(
             _mark_turn_routed(agent, state, turn_id, source)
         return None
 
+    # Selection reads the registry unlocked; the fence is re-checked under
+    # the lock immediately before the coordinated assignment.
     result = select_and_commit_route(
         agent,
         admission,
@@ -1112,9 +984,18 @@ def _route_tool_surface(
         available_toolsets=available,
         caller="route",
     )
-    state.last_expansion_result = result
-    if source == "pre_turn_context_build":
-        _mark_turn_routed(agent, state, turn_id, source)
+    with fenced_section() as may_commit:
+        if not may_commit:
+            # Late or stale hook (abandoned by a Hermes hook timeout, session
+            # ended or agent reused meanwhile): nothing was committed.
+            logger.warning(
+                "%s: discarded a stale route for session %s", PLUGIN_NAME, session_id
+            )
+            return None
+        state.last_expansion_result = result
+        state._retry_turn_id = turn_id or None
+        if source == "pre_turn_context_build":
+            _mark_turn_routed(agent, state, turn_id, source)
     return None
 
 
@@ -1139,13 +1020,228 @@ def _call_admission_for_current(
     )
 
 
+def pre_tool_call(**kwargs: Any) -> dict[str, Any] | None:
+    """Keep protected capability inside the envelope behind Hermes tool search.
+
+    Hermes unwraps ``tool_call`` before this hook, so ``tool_name`` is the
+    real deferred tool.  The bridge authorizes any deferrable tool whose
+    toolset is enabled; a protected toolset can stay enabled because some of
+    its tools were captured (and are visible), which would expose uncaptured
+    siblings.  While this router has the surface narrowed, block a tool that
+    is not visible, not a captured definition, and owned by a protected
+    toolset.  Everything else proceeds untouched.
+    """
+    tool_name = str(kwargs.get("tool_name") or "")
+    session_id = str(kwargs.get("session_id") or "")
+    if not tool_name or not session_id:
+        return None
+    try:
+        agent = _resolve_hook_agent(kwargs.get("agent"), session_id)
+        if agent is None:
+            return None
+        state = _get_router_state(agent)
+        if not getattr(state, "surface_narrowed", False):
+            return None
+        if tool_name in set(getattr(agent, "valid_tool_names", ()) or ()):
+            return None
+        admission = state.bound_host_admission(session_id)
+        if admission is None or admission.envelope is None or admission.effective_policy is None:
+            # Agent reused after a failed or expired teardown: enforce the
+            # retired (or still-bound, orphaned) policy.
+            retired = getattr(state, "_retired_admission", None) or _orphaned_lifecycle(
+                state, session_id
+            )
+            admission = retired[1] if retired is not None else None
+        if admission is None or admission.envelope is None or admission.effective_policy is None:
+            return None
+        protected = admission.effective_policy.protected_toolsets
+        if not protected:
+            return None
+        if any(item.name == tool_name for item in admission.envelope.definitions):
+            return None
+        from tools.registry import registry
+        entry = registry.get_entry(tool_name)
+        owner = getattr(entry, "toolset", None) if entry is not None else None
+    except Exception as exc:  # noqa: BLE001 - never break unrelated tool calls
+        logger.debug("%s: pre_tool_call guard skipped: %s", PLUGIN_NAME, exc)
+        return None
+    if owner in protected:
+        return {
+            "action": "block",
+            "message": (
+                f"'{tool_name}' belongs to the protected toolset '{owner}' and was not "
+                "admitted for this session."
+            ),
+        }
+    return None
+
+
+# Hermes abandons (but does not cancel) timeout-bounded hook callbacks after
+# plugins.hook_callback_timeout (default 30 s, <= 0 disables the timeout, max
+# 600 s).  A hook that has not committed within half of that never commits.
+_DEFAULT_HOOK_CALLBACK_TIMEOUT_S = 30.0
+_MAX_HOOK_CALLBACK_TIMEOUT_S = 600.0
+
+
+def _hook_callback_timeout_s() -> float:
+    """Hermes's own effective timeout; the same normalization as a fallback."""
+    try:
+        from hermes_cli.plugins import _resolve_hook_callback_timeout
+
+        return float(_resolve_hook_callback_timeout())
+    except Exception as exc:  # noqa: BLE001 - standalone/older hosts normalize locally
+        logger.debug("%s: Hermes timeout resolver unavailable (%s)", PLUGIN_NAME, exc)
+    timeout = _DEFAULT_HOOK_CALLBACK_TIMEOUT_S
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        plugins_cfg = (load_config_readonly() or {}).get("plugins")
+        if isinstance(plugins_cfg, dict) and plugins_cfg.get("hook_callback_timeout") is not None:
+            configured = float(plugins_cfg["hook_callback_timeout"])
+            if configured >= 0:
+                timeout = min(configured, _MAX_HOOK_CALLBACK_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("%s: hook_callback_timeout unavailable (%s); using %ss", PLUGIN_NAME, exc, timeout)
+    return timeout
+
+
+def _hook_commit_budget_s() -> float:
+    """Seconds after hook start during which a commit is still allowed."""
+    timeout = _hook_callback_timeout_s()
+    if not math.isfinite(timeout) or timeout <= 0:
+        # Hermes runs the hook synchronously and never abandons it.
+        return math.inf
+    return timeout * 0.5
+
+
+def _orphaned_lifecycle(state: RouterState, session_id: str) -> tuple[str, Any] | None:
+    """A narrowed surface still bound to another session's admission."""
+    bound_session = getattr(state, "_admission_session_id", None)
+    bound = getattr(state, "_bound_admission_result", None)
+    if (
+        getattr(state, "surface_narrowed", False)
+        and bound_session is not None
+        and bound_session != session_id
+        and bound is not None
+    ):
+        return (bound_session, bound)
+    return None
+
+
+def _retry_retired_restore(
+    agent: Any, state: RouterState, session_id: str, fence: _HookFence | None = None
+) -> bool:
+    """Release an agent left narrowed by a failed session-end restore.
+
+    Returns True when the agent is free for ``session_id``.  Until then it is
+    quarantined: no capture, no routing, and pre_tool_call keeps the retired
+    policy.  Runs under the caller's fence (lifecycle and deadline).
+
+    Handoff rule (fresh-agent recovery): the quarantine is released only by
+    a successful restore of the retired envelope, and that restore is only
+    attempted while the agent shows exactly the surface this router last
+    committed (every definition and enabled_toolsets).  Any other change is
+    ambiguous (a partial addition is not a handoff), so the agent stays
+    quarantined; recovery is to discard that agent, a fresh one is unaffected.
+    """
+    if getattr(state, "_retired_admission", None) is None:
+        orphan = _orphaned_lifecycle(state, session_id)
+        if orphan is None:
+            return True
+        with fenced_section() as may_commit:
+            if not may_commit:
+                return False
+            if getattr(state, "_retired_admission", None) is None and _orphaned_lifecycle(
+                state, session_id
+            ) == orphan:
+                # A teardown expired before recording retirement: adopt the
+                # still-narrowed lifecycle as quarantine.
+                state._retired_admission = orphan
+    retired = getattr(state, "_retired_admission", None)
+    if retired is None:
+        return True
+    retired_session, retired_admission = retired
+    if retired_session == session_id:
+        return True
+    with fenced_section() as may_commit:
+        if not may_commit:
+            return False
+        if getattr(state, "_retired_admission", None) is not retired:
+            return True
+        if surface_is_router_committed(agent, state) and restore_admitted_envelope(
+            agent, retired_admission
+        ):
+            state.end_admission(retired_session)
+            state.reset()
+            if fence is not None:
+                fence.rebase()
+            return True
+        if getattr(state, "_quarantine_warned_session", None) != session_id:
+            state._quarantine_warned_session = session_id
+            logger.warning(
+                "%s: agent reused for session %s while session %s's narrowed surface is "
+                "still unrestored; routing is paused and protected tools stay guarded. "
+                "Recovery: discard this agent (a fresh agent is unaffected).",
+                PLUGIN_NAME,
+                session_id,
+                retired_session,
+            )
+    return False
+
+
+def _resolve_hook_agent(explicit: Any, session_id: Any) -> Any:
+    """Explicit agent first, then validated stored ref, then stack/threads.
+
+    Every candidate must carry the call's session id when one is given.
+    """
+    sid = str(session_id or "")
+    if explicit is not None and (not sid or _agent_session_matches_id(explicit, sid)):
+        return explicit
+    if sid:
+        return _get_validated_agent_ref(sid) or _get_agent_from_stack(sid)
+    return _get_agent_ref(None) or _get_agent_from_stack()
+
+
+def _agent_session_matches_id(agent: Any, session_id: str) -> bool:
+    try:
+        return str(getattr(agent, "session_id", "") or "") == session_id
+    except Exception:  # noqa: BLE001 - foreign objects
+        return False
+
+
+def _normalize_toolset_name(name: str, available: set[str]) -> str:
+    """Exact name, else the unique case-insensitive match, else lower-case.
+
+    Ambiguous case-insensitive matches (``Team`` and ``team``) are returned
+    unchanged so validation rejects them instead of picking one at random.
+    """
+    if name in available:
+        return name
+    matches = sorted(candidate for candidate in available if candidate.lower() == name.lower())
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        return name
+    return name.lower()
+
+
 def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
     """Return a truthful result for one guarded expansion request."""
+    session_id = str(kwargs.get("session_id") or "")
+    agent = _resolve_hook_agent(kwargs.get("agent"), session_id)
+    if agent is None:
+        return _request_toolset(args, **kwargs)
+    sid = session_id or str(getattr(agent, "session_id", "") or "")
+    with _hook_fence(agent, sid):
+        return _request_toolset(args, **kwargs)
+
+
+def _request_toolset(args: dict[str, Any], **kwargs: Any) -> str:
     args = args if isinstance(args, dict) else {}
-    requested_toolset = str(args.get("toolset") or args.get("toolset_name") or "").strip().lower()
+    requested_toolset = str(args.get("toolset") or args.get("toolset_name") or "").strip()
     raw_toolsets = args.get("toolsets") or []
     requested_toolsets = {
-        str(name).strip().lower()
+        str(name).strip()
         for name in raw_toolsets
         if isinstance(raw_toolsets, list) and str(name).strip()
     }
@@ -1154,7 +1250,7 @@ def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
     requested_tool = str(args.get("tool_name") or "").strip()
     reason = str(args.get("reason") or "").strip()[:200]
     session_id = str(kwargs.get("session_id") or "")
-    agent = _get_agent_ref(session_id) or kwargs.get("agent") or _get_agent_from_stack()
+    agent = _resolve_hook_agent(kwargs.get("agent"), session_id)
     admission: EnsureAdmissionResult | None = None
     if agent is not None:
         session_id = session_id or str(getattr(agent, "session_id", "") or "")
@@ -1167,6 +1263,9 @@ def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
     try:
         from tools.registry import registry as validation_registry
         available = set(validation_registry.get_registered_toolset_names())
+        # Exact registered names first (mixed-case custom/MCP toolsets), then
+        # a case-insensitive match, then the lower-cased name for aliases.
+        requested_toolsets = {_normalize_toolset_name(name, available) for name in requested_toolsets}
         if requested_tool and (
             admission is None
             or admission.status
@@ -1256,19 +1355,33 @@ def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
         caller="visible_request",
         session_id=session_id,
     )
-    if result.retry_allowed:
-        _get_router_state(agent)._retry_pending = False
+    # The automatic post-tool retry latch is per turn; an explicit request
+    # does not reset it.
+    ok = result.ok
+    outcome = result.reason
+    if "STALE_LIFECYCLE" in tuple(getattr(admission, "diagnostics", ()) or ()):
+        outcome = "STALE_LIFECYCLE"
+    denied_tool_names = list(result.denied_tool_names)
+    if requested_tool and requested_tool not in (getattr(agent, "valid_tool_names", set()) or set()):
+        # An exact tool that is still not installed is never a success.
+        ok = False
+        if requested_tool not in denied_tool_names:
+            denied_tool_names.append(requested_tool)
+        if outcome in {"NO_MUTATION", "READY", "EXPANDED"}:
+            outcome = "UNRESOLVED_TOOL"
     payload = {
-        "ok": result.ok,
+        "ok": ok,
         "toolsets": list(result.requested_toolsets),
         "requested_toolsets": list(result.requested_toolsets),
         "expanded_toolsets": list(result.expanded_toolsets),
         "denied_toolsets": list(result.denied_toolsets),
-        "denied_tool_names": list(result.denied_tool_names),
+        "denied_tool_names": sorted(denied_tool_names),
         "added_tool_names": list(result.added_tool_names),
         "installed_tool_names": list(result.installed_tool_names),
         "requested_tool": requested_tool,
-        "reason": reason or result.reason,
+        # Machine outcome; the caller's own justification is kept separately.
+        "reason": outcome,
+        "request_reason": reason,
         "retry_allowed": result.retry_allowed,
         "enabled_tools": sorted(getattr(agent, "valid_tool_names", set()) or set()),
     }
@@ -1280,7 +1393,7 @@ def request_toolset_handler(args: Dict[str, Any], **kwargs: Any) -> str:
 def tool_request_middleware(**kwargs: Any) -> Optional[Dict[str, Any]]:
     """Admit a missing exact tool before normal Hermes dispatch validation."""
     session_id = str(kwargs.get("session_id") or "")
-    agent = _get_agent_ref(session_id) or kwargs.get("agent") or _get_agent_from_stack()
+    agent = _resolve_hook_agent(kwargs.get("agent"), session_id)
     tool_name = str(kwargs.get("tool_name") or "").strip()
     args = kwargs.get("args")
     if agent is None or not tool_name or not isinstance(args, dict):
@@ -1288,17 +1401,19 @@ def tool_request_middleware(**kwargs: Any) -> Optional[Dict[str, Any]]:
     session_id = session_id or str(getattr(agent, "session_id", "") or "")
     if tool_name in (getattr(agent, "valid_tool_names", set()) or set()):
         return None
-    admission = _call_admission_for_current(
-        "middleware", agent, session_id, kwargs
-    )
-    expand_admitted_toolsets(
-        agent,
-        admission,
-        requested_toolsets=set(),
-        requested_tool_names={tool_name},
-        caller="middleware",
-        session_id=session_id,
-    )
+    with _hook_fence(agent, session_id) as fence:
+        admission = _call_admission_for_current(
+            "middleware", agent, session_id, kwargs
+        )
+        fence.pin_admission()
+        expand_admitted_toolsets(
+            agent,
+            admission,
+            requested_toolsets=set(),
+            requested_tool_names={tool_name},
+            caller="middleware",
+            session_id=session_id,
+        )
     if tool_name not in (getattr(agent, "valid_tool_names", set()) or set()):
         return None
     return {"args": dict(args), "router_recovered": _toolset_for_installed_name(tool_name, admission)}
@@ -1335,7 +1450,7 @@ def _owner_for_name_handler(name: str, registry: Any) -> str | None:
 def post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
     """Retry only after a guarded exact installation succeeded."""
     session_id = str(kwargs.get("session_id") or "")
-    agent = _get_agent_ref(session_id) or kwargs.get("agent") or _get_agent_from_stack()
+    agent = _resolve_hook_agent(kwargs.get("agent"), session_id)
     tool_name = str(kwargs.get("tool_name") or "").strip()
     if agent is None or not tool_name:
         return None
@@ -1343,19 +1458,26 @@ def post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
     state = _get_router_state(agent)
     if state._retry_pending or tool_name in (getattr(agent, "valid_tool_names", set()) or set()):
         return None
-    admission = _call_admission_for_current(
-        "post_tool", agent, session_id, kwargs
-    )
-    result = expand_admitted_toolsets(
-        agent,
-        admission,
-        requested_toolsets=set(),
-        requested_tool_names={tool_name},
-        caller="post_tool",
-        session_id=session_id,
-    )
-    if tool_name in (getattr(agent, "valid_tool_names", set()) or set()) and result.retry_allowed:
-        state._retry_pending = True
+    started = time.monotonic()
+    # One automatic recovery per turn: an overlapping callback that finds the
+    # latch taken at its commit boundary does not commit.
+    with _hook_fence(
+        agent, session_id, deadline=started + _hook_commit_budget_s(), require_retry_available=True
+    ) as fence:
+        admission = _call_admission_for_current(
+            "post_tool", agent, session_id, kwargs
+        )
+        fence.pin_admission()
+        result = expand_admitted_toolsets(
+            agent,
+            admission,
+            requested_toolsets=set(),
+            requested_tool_names={tool_name},
+            caller="post_tool",
+            session_id=session_id,
+            claim_retry_for=tool_name,
+        )
+    del result
     return None
 
 

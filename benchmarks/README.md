@@ -1,6 +1,6 @@
 # Router benchmark corpus
 
-`prompts.jsonl` is a 500-record synthetic deterministic regression corpus. It verifies stable routing contracts and critical-class recall; it is not, by itself, evidence of real-world task parity.
+`prompts.jsonl` is a 506-record synthetic (including 6 capability-question records) deterministic regression corpus. It verifies stable routing contracts and critical-class recall; it is not, by itself, evidence of real-world task parity.
 
 Run:
 

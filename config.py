@@ -48,20 +48,52 @@ def _get_profile_config(cfg: dict) -> dict:
                 inferred = home_path.name
         profile_name = inferred
 
-    # Look up per-profile config
-    profiles_config = cfg.get("profiles", {})
-    profile_cfg = profiles_config.get(profile_name, {})
-
-    # Fall back to global
-    global_cfg = cfg.get("global", {})
-    if profile_cfg.get("enabled", global_cfg.get("enabled", False)):
-        result = dict(global_cfg)
-        result.update(profile_cfg)
-        result["_profile_name"] = profile_name
-        return result
+    merged = _get_profile_settings(cfg, profile_name)
+    if merged.get("enabled", False):
+        return merged
 
     # Not enabled for this profile
     return {"enabled": False, "_profile_name": profile_name}
+
+
+def _current_profile_name() -> str:
+    explicit_profile = os.environ.get("HERMES_PROFILE") or os.environ.get("HERMES_ACTIVE_PROFILE")
+    if explicit_profile:
+        return explicit_profile
+    hermes_home = os.environ.get("HERMES_HOME", "")
+    if hermes_home:
+        home_path = Path(hermes_home).expanduser().resolve()
+        if home_path.parent.name == "profiles":
+            return home_path.name
+    return "default"
+
+
+def _get_profile_settings(cfg: dict, profile_name: str | None = None) -> dict:
+    """Merged global + profile settings, whether or not routing is enabled.
+
+    Used when /router turns routing on for a profile whose config says off,
+    so the operator's floors, thresholds and classifier settings still apply.
+    """
+    if profile_name is None:
+        profile_name = _current_profile_name()
+    profiles_config = (cfg or {}).get("profiles", {}) or {}
+    profile_cfg = profiles_config.get(profile_name, {}) or {}
+    global_cfg = (cfg or {}).get("global", {}) or {}
+    result = dict(global_cfg)
+    result.update(profile_cfg)
+    result["enabled"] = bool(profile_cfg.get("enabled", global_cfg.get("enabled", False)))
+    result["_profile_name"] = profile_name
+    return result
+
+
+def _env_override() -> bool | None:
+    """HERMES_TOKEN_ROUTER_ENABLED: True/False when set to a recognised value."""
+    override = os.environ.get("HERMES_TOKEN_ROUTER_ENABLED", "").strip().lower()
+    if override in {"0", "false", "no", "off"}:
+        return False
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    return None
 def _is_classifier_enabled(profile_cfg: dict) -> bool:
     """The external classifier is opt-in; deterministic routing works without it."""
     classifier = profile_cfg.get("classifier", {})

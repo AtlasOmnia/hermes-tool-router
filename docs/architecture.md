@@ -11,6 +11,7 @@ The v2 router classifies the initial user turn, applies the smallest confidently
 5. The global recovery schema/catalog is discoverability only; protected definitions come only from a valid immutable envelope.
 6. Unknown profiles never inherit the first enabled profile by insertion order.
 7. External classification is opt-in.
+8. After a READY route, the visible `request_toolset` is an agent-local copy whose description (and `toolsets` parameter description) carries the session capability catalog built from the envelope's definition owners. This is the one sanctioned rewrite of a captured definition: it applies only to this plugin's own control, never when the host protected or pinned it, and the frozen envelope itself is unchanged. Fallback/disable paths restore the exact envelope, including the captured `request_toolset`.
 
 ## Required upstream seams
 
