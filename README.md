@@ -172,6 +172,21 @@ A paired full-tools-versus-routed evaluation using `openai/gpt-5.4-mini` produce
 
 The run used stock Hermes hooks and no core patch. See [`docs/live-evaluation-v0.2-rc1.md`](docs/live-evaluation-v0.2-rc1.md) for the corpus, methodology, commands, raw token counts, and scope limitations.
 
+## Router on/off smoke test (2026-10-14)
+
+A paired run after #16 on a cloned test profile, deterministic rules only, Claude Opus as the main model. Each prompt ran once with the router off and once on.
+
+| | Router off | Router on | Change |
+|---|---:|---:|---:|
+| Starting prompt, average of 3 no-tool prompts | 29,185 tokens | 18,775 tokens | **−36%** |
+| Read a file (2 calls) | 58,318 | 40,162 | −31% |
+| Run a shell command (2 calls) | 59,379 | 40,123 | −32% |
+| Web search (2 calls off, 3 on) | 62,286 | 62,268 | 0% |
+| List scheduled jobs (3 calls off, 2 on) | 96,786 | 42,324 | −56% |
+| **All seven tasks** | **364,325** | **241,203** | **−34%** |
+
+On a larger profile with more toolsets and integrations, the same "What can you do?" starting prompt went from 58,608 to 24,813 tokens (−58%). Answers were equivalent in every pair. Figures are provider-reported input tokens (fresh + cache read + cache write) summed over the whole task; they are token counts, not cost, from one run per prompt. Details and caveats: [`docs/smoke-test-2026-10-14.md`](docs/smoke-test-2026-10-14.md).
+
 ## Current release gates
 
 A stable release must demonstrate:
