@@ -7,7 +7,7 @@ Experimental standalone Hermes Agent plugin for reducing first-turn tool-schema 
 ## How it works
 
 <p align="center">
-  <img src="docs/tool-router-flow.svg" alt="Hermes Tool Router flow: classify the first turn, narrow the tool schema when confidence is high, fail open when uncertain, and add missing toolsets permanently for the session." width="100%">
+  <img src="docs/tool-router-flow.svg" alt="Hermes Tool Router flow, with and without a classifier model: route the first turn with deterministic rules only or with an optional small classifier, narrow the tool list when confidence is high, fail open when uncertain, and add missing toolsets permanently for the session. By AtlasOmnia." width="100%">
 </p>
 
 The router classifies only the first turn. High-confidence routes send a smaller tool schema to the main model; uncertainty keeps the full surface. If a pruned registered tool is needed later, Hermes adds its owning toolset without re-pruning the session. The narrowed session carries a short catalog of everything it can load, so the model can still answer "what can you do?" accurately, and `/router off` turns routing off without a model call.
