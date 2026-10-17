@@ -1435,6 +1435,21 @@ def _request_toolset(args: dict[str, Any], **kwargs: Any) -> str:
     return json.dumps(payload, sort_keys=True)
 
 
+def _disabled_router_must_not_touch(agent: Any) -> bool:
+    """A disabled router never mutates a surface it did not narrow.
+
+    Recovery hooks (tool_request middleware, post_tool_call) only exist to undo
+    this router's own narrowing; on an unrouted session they would rebuild the
+    host's tool surface from the router's partial owner map.
+    """
+    try:
+        if _router_enabled(_load_config(), agent):
+            return False
+    except Exception:  # noqa: BLE001 - fail closed: an unreadable config never mutates
+        return True
+    return not getattr(_get_router_state(agent), "active", False)
+
+
 def tool_request_middleware(**kwargs: Any) -> Optional[Dict[str, Any]]:
     """Admit a missing exact tool before normal Hermes dispatch validation."""
     session_id = str(kwargs.get("session_id") or "")
@@ -1445,6 +1460,8 @@ def tool_request_middleware(**kwargs: Any) -> Optional[Dict[str, Any]]:
         return None
     session_id = session_id or str(getattr(agent, "session_id", "") or "")
     if tool_name in (getattr(agent, "valid_tool_names", set()) or set()):
+        return None
+    if _disabled_router_must_not_touch(agent):
         return None
     with _hook_fence(agent, session_id) as fence:
         admission = _call_admission_for_current(
@@ -1502,6 +1519,8 @@ def post_tool_call(**kwargs: Any) -> Optional[Dict[str, Any]]:
     session_id = session_id or str(getattr(agent, "session_id", "") or "")
     state = _get_router_state(agent)
     if state._retry_pending or tool_name in (getattr(agent, "valid_tool_names", set()) or set()):
+        return None
+    if _disabled_router_must_not_touch(agent):
         return None
     started = time.monotonic()
     # One automatic recovery per turn: an overlapping callback that finds the
