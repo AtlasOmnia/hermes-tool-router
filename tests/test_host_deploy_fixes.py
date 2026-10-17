@@ -81,3 +81,16 @@ def test_commit_emits_one_info_telemetry_line(
     assert result == {"args": {}, "router_recovered": "file"}
     assert "read_file" in _rev6_names(agent)
     assert any("surface committed" in r.getMessage() for r in caplog.records)
+
+
+def test_disabled_router_guard_uses_the_agents_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Launch profile disabled, served profile enabled: recovery still runs."""
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.setattr(router, "_RUNTIME_OVERRIDE", None)
+    monkeypatch.delenv("HERMES_TOKEN_ROUTER_ENABLED", raising=False)
+    cfg = {"global": {"enabled": False}, "profiles": {"ai-os": {"enabled": True}}}
+    monkeypatch.setattr(router, "_load_config", lambda: cfg)
+    served = SimpleNamespace(_profile_name="ai-os")
+    launch = SimpleNamespace()
+    assert router._disabled_router_must_not_touch(served) is False
+    assert router._disabled_router_must_not_touch(launch) is True
