@@ -94,3 +94,41 @@ def test_disabled_router_guard_uses_the_agents_profile(monkeypatch: pytest.Monke
     launch = SimpleNamespace()
     assert router._disabled_router_must_not_touch(served) is False
     assert router._disabled_router_must_not_touch(launch) is True
+
+
+def test_served_profile_override_beats_launch_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Desktop/tui_gateway serving a profile binds a HERMES_HOME override while
+    the env keeps the launch profile; the agent carries no _profile_name (#23)."""
+    import sys
+    import types
+
+    override = {"value": None}
+    consts = types.ModuleType("hermes_constants")
+    consts.get_hermes_home_override = lambda: override["value"]
+    profiles = types.ModuleType("hermes_cli.profiles")
+    profiles.current_profile_name = lambda default=None: "ai-os" if override["value"] else "default"
+    cli = types.ModuleType("hermes_cli")
+    cli.profiles = profiles
+    monkeypatch.setitem(sys.modules, "hermes_constants", consts)
+    monkeypatch.setitem(sys.modules, "hermes_cli", cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.profiles", profiles)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.setattr(router, "_RUNTIME_OVERRIDE", None)
+    monkeypatch.delenv("HERMES_TOKEN_ROUTER_ENABLED", raising=False)
+    cfg = {"global": {"enabled": False}, "profiles": {"ai-os": {"enabled": True}}}
+    agent = SimpleNamespace()  # no _profile_name / agent_identity, like current hosts
+
+    assert router._router_enabled(cfg, agent) is False  # no override: launch env
+    override["value"] = "/h/profiles/ai-os"
+    assert router._router_enabled(cfg, agent) is True
+    assert router._routing_settings(cfg, agent)["_profile_name"] == "ai-os"
+
+
+def test_pyproject_has_no_build_system_table() -> None:
+    """Two homes with this plugin must not collide as one uv workspace name (#23)."""
+    import tomllib
+    from pathlib import Path
+
+    doc = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
+    assert "build-system" not in doc
+    assert doc.get("tool", {}).get("uv", {}).get("package") is not True

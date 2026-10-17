@@ -35,23 +35,7 @@ def _get_profile_config(cfg: dict, profile_name: str | None = None) -> dict:
     if profile_name:
         return _get_profile_settings(cfg, profile_name)
 
-    # Determine active profile from env (in priority order).
-    explicit_profile = os.environ.get("HERMES_PROFILE") or \
-                       os.environ.get("HERMES_ACTIVE_PROFILE")
-
-    if explicit_profile:
-        profile_name = explicit_profile
-    else:
-        # No explicit profile env: infer only from the canonical Hermes home.
-        # Never activate the first enabled profile by insertion order; applying
-        # another profile's policy is less safe than failing closed here.
-        hermes_home = os.environ.get("HERMES_HOME", "")
-        inferred = "default"
-        if hermes_home:
-            home_path = Path(hermes_home).expanduser().resolve()
-            if home_path.parent.name == "profiles":
-                inferred = home_path.name
-        profile_name = inferred
+    profile_name = _current_profile_name()
 
     merged = _get_profile_settings(cfg, profile_name)
     if merged.get("enabled", False):
@@ -61,7 +45,36 @@ def _get_profile_config(cfg: dict, profile_name: str | None = None) -> dict:
     return {"enabled": False, "_profile_name": profile_name}
 
 
+def _served_profile_name() -> str | None:
+    """The profile a multiplexed host is serving on this task, if it says so.
+
+    A gateway or desktop backend serving several profiles binds a context-local
+    HERMES_HOME override per turn while the process env keeps the LAUNCH
+    profile, and current hosts do not set ``agent._profile_name``. Only an
+    explicit override is trusted; without one the env rules below apply.
+    """
+    try:
+        from hermes_constants import get_hermes_home_override
+
+        if get_hermes_home_override() is None:
+            return None
+        from hermes_cli.profiles import current_profile_name
+
+        name = current_profile_name()
+    except Exception:  # noqa: BLE001 - older or test hosts lack these seams
+        return None
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
 def _current_profile_name() -> str:
+    """Served profile, else HERMES_PROFILE/HERMES_ACTIVE_PROFILE, else HERMES_HOME.
+
+    Never activates the first enabled profile by insertion order; applying
+    another profile's policy is less safe than falling back to ``default``.
+    """
+    served = _served_profile_name()
+    if served:
+        return served
     explicit_profile = os.environ.get("HERMES_PROFILE") or os.environ.get("HERMES_ACTIVE_PROFILE")
     if explicit_profile:
         return explicit_profile

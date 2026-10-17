@@ -139,7 +139,9 @@ Only set these for servers that accept them; an unknown field rejected by the pr
 
 ### Profiles under a multiplexed gateway
 
-Each turn resolves the router profile from the agent (`agent._profile_name`), falling back to `HERMES_PROFILE` / `HERMES_HOME`. A gateway serving several profiles therefore applies each served profile's own `profiles:` entry instead of the launch profile's.
+Each turn resolves the router profile from the agent (`agent._profile_name` / `agent_identity`), then from the host's per-turn profile binding (the context-local `HERMES_HOME` override that gateway and desktop/`tui_gateway` backends set while serving a profile), and only then from `HERMES_PROFILE` / `HERMES_HOME`. A backend serving several profiles therefore applies each served profile's own `profiles:` entry instead of the launch profile's.
+
+The plugin may be installed in the launch home and in a profile at the same time. `pyproject.toml` deliberately has no `[build-system]` table, so Hermes' dependency manager treats each copy as a metadata-only member with a per-home name; with one, both copies claimed the name `hermes-tool-router`, the dependency lock failed, and Hermes disabled the profile copy (`plugins.disabled`), leaving that profile's sessions unrouted. If an older copy was disabled this way, re-enable it with `hermes --profile <name> plugins enable hermes-token-router` after updating.
 
 ### Diagnostics
 
