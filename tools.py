@@ -622,6 +622,14 @@ def _assign_candidate(
         raise
     state.surface_revision = getattr(state, "surface_revision", 0) + 1
     state.committed_surface = _surface_fingerprint(agent)
+    logger.info(
+        "hermes-token-router: surface committed session=%s profile=%s initial=%s "
+        "predicted=%s tools=%d toolsets=%s",
+        str(getattr(agent, "session_id", "") or "")[:24],
+        getattr(agent, "_profile_name", None) or getattr(agent, "agent_identity", None) or "?",
+        initial, sorted(predicted_toolsets) if predicted_toolsets is not None else None,
+        len(names), sorted(enabled),
+    )
 
 
 def _surface_fingerprint(agent: Any) -> Any:

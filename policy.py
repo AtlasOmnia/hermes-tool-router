@@ -400,6 +400,7 @@ def _predict_toolsets_via_llm(
     hard_timeout_seconds: float = 1.2,
     custom_base_url: str = "",
     custom_api_key_env: str = "",
+    extra_body: dict | None = None,
 ) -> Optional[Set[str]]:
     """Use the router model to predict which toolsets are needed.
 
@@ -441,11 +442,15 @@ def _predict_toolsets_via_llm(
         )
 
         def invoke_classifier():
+            kwargs = {}
+            if extra_body:
+                kwargs["extra_body"] = extra_body
             return client.chat.completions.create(
                 model=model,
                 messages=[{"role": "system", "content": prompt}],
                 temperature=0.0,
                 max_tokens=200,
+                **kwargs,
             )
 
         try:
