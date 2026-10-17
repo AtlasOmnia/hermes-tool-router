@@ -143,6 +143,8 @@ Each turn resolves the router profile from the agent (`agent._profile_name` / `a
 
 The plugin may be installed in the launch home and in a profile at the same time. `pyproject.toml` deliberately has no `[build-system]` table, so Hermes' dependency manager treats each copy as a metadata-only member with a per-home name; with one, both copies claimed the name `hermes-tool-router`, the dependency lock failed, and Hermes disabled the profile copy (`plugins.disabled`), leaving that profile's sessions unrouted. If an older copy was disabled this way, re-enable it with `hermes --profile <name> plugins enable hermes-token-router` after updating.
 
+Since the plugin is no longer built into Hermes' dependency environment, it is not importable as the `hermes_token_router_plugin` entry point there. A profile that enables the router without its own `plugins/hermes-token-router` directory used to load it through that entry point and now reports `No module named 'hermes_token_router_plugin'`. Give such a profile a copy, or a symlink to the launch-home copy (`ln -s ~/.hermes/plugins/hermes-token-router ~/.hermes/profiles/<name>/plugins/`). Symlinks resolve to one dependency member, so they never collide. A `pip install` of this repository still provides the entry point.
+
 ### Diagnostics
 
 Every committed surface logs one INFO line (`surface committed session=... profile=... predicted=... tools=... toolsets=...`). Set `global.debug_logging: true` to also write every bail-out reason to a rotating `router-debug.log` in the plugin directory (2 MB x 3); host logging is unchanged.
