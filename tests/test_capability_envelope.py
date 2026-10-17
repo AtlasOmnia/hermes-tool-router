@@ -4678,3 +4678,49 @@ def test_recovery_after_positive_narrowing_uses_captured_schema_and_denies_regis
     assert denied["ok"] is False
     assert "kanban_sibling" in denied["denied_tool_names"]
     assert "kanban_sibling" not in _rev6_names(agent)
+
+
+def test_middleware_expansion_never_drops_already_enabled_toolsets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An admitted expansion is monotonic: enabled toolsets with no visible tool
+    (deferred behind tool search) must survive, or the next turn's tool search
+    collapses to the single recovered toolset."""
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    agent = _rev6_agent(
+        registry,
+        "middleware-monotonic",
+        names=("web_search", "request_toolset"),
+        enabled=("web", "terminal", "kanban", "router_recovery"),
+    )
+    recovered = router.tool_request_middleware(
+        agent=agent, session_id=agent.session_id, tool_name="read_file", args={}
+    )
+    assert recovered == {"args": {}, "router_recovered": "file"}
+    assert "read_file" in _rev6_names(agent)
+    assert {"web", "terminal", "kanban", "router_recovery", "file"} <= set(agent.enabled_toolsets)
+
+
+def test_disabled_router_middleware_never_touches_unrouted_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry, enabled=False)
+    monkeypatch.setattr(router, "_RUNTIME_OVERRIDE", None)
+    agent = _rev6_agent(
+        registry,
+        "middleware-disabled",
+        names=("web_search", "request_toolset"),
+        enabled=("web", "terminal", "router_recovery"),
+    )
+    before = (list(agent.tools), set(agent.valid_tool_names), list(agent.enabled_toolsets))
+    assert router.tool_request_middleware(
+        agent=agent, session_id=agent.session_id, tool_name="read_file", args={}
+    ) is None
+    assert router.post_tool_call(
+        agent=agent, session_id=agent.session_id, tool_name="read_file", args={}, result="{}"
+    ) is None
+    assert (list(agent.tools), set(agent.valid_tool_names), list(agent.enabled_toolsets)) == before

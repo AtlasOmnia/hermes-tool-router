@@ -550,6 +550,12 @@ def _commit_candidate(
         or (toolset == RECOVERY_TOOLSET and RECOVERY_TOOL_NAME in names)
     ]
     enabled.extend(sorted(represented - set(enabled)))
+    if not initial and exact_enabled_toolsets is None:
+        # Expansion is monotonic: never drop a toolset that is already enabled.
+        # Toolsets whose tools are deferred behind tool search have no visible
+        # name here, so owner reconstruction would silently disable them and
+        # the next turn's catalog would collapse to the recovered toolset.
+        enabled = base + sorted(set(enabled) - set(base))
     if exact_enabled_toolsets is not None:
         # Exact restore: the captured list as-is, no owner reconstruction.
         enabled = list(exact_enabled_toolsets)
