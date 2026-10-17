@@ -1,7 +1,9 @@
-[build-system]
-requires = ["setuptools>=69", "wheel"]
-build-backend = "setuptools.build_meta"
-
+# No [build-system] table, on purpose. Hermes' dependency manager treats a plugin
+# whose pyproject has one as buildable and keeps its [project].name, so the same
+# plugin installed in two homes (launch home + a profile) declares one workspace
+# member name twice, `uv lock` fails, and Hermes disables the profile copy (#20,
+# #23). Without the table the member is metadata-only and gets a per-home name.
+# pip and `python -m build` fall back to setuptools (PEP 517 default backend).
 [project]
 name = "hermes-tool-router"
 version = "0.2.0rc1"
