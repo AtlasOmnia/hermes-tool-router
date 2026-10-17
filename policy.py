@@ -400,7 +400,7 @@ def _predict_toolsets_via_llm(
     hard_timeout_seconds: float = 1.2,
     custom_base_url: str = "",
     custom_api_key_env: str = "",
-    extra_body: Optional[dict] = None,
+    extra_body: dict | None = None,
 ) -> Optional[Set[str]]:
     """Use the router model to predict which toolsets are needed.
 

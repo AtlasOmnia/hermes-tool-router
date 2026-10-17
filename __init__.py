@@ -520,13 +520,14 @@ _cfg = _load_config() if CONFIG_FILE.exists() else {}
 _prof_cfg = _get_profile_config(_cfg)
 logger.info("%s: plugin loaded profile=%s enabled=%s", PLUGIN_NAME, _prof_cfg.get("_profile_name"), _prof_cfg.get("enabled"))
 
-# Local patch: global.debug_logging: true in the plugin config raises THIS
-# logger to DEBUG (every bail-out reason logs) without touching host logging.
+# global.debug_logging: true raises THIS logger to DEBUG (every bail-out
+# reason logs) and writes router-debug.log in the plugin directory without
+# touching host logging, whose file handlers cap at INFO.
 try:
     if isinstance(_cfg.get("global"), dict) and _cfg["global"].get("debug_logging"):
         import logging as _logging
-        from pathlib import Path as _P
         from logging.handlers import RotatingFileHandler as _RFH
+        from pathlib import Path as _P
         logger.setLevel(_logging.DEBUG)
         if not any(getattr(h, "_htr_debug", False) for h in logger.handlers):
             _dbg_h = _RFH(_P(__file__).resolve().parent / "router-debug.log",
@@ -537,8 +538,8 @@ try:
                 defaults={"session_id": ""}))
             _dbg_h._htr_debug = True
             logger.addHandler(_dbg_h)
-except Exception:
-    pass
+except Exception as _dbg_exc:  # noqa: BLE001 - optional diagnostics never block plugin load
+    logger.warning("%s: debug_logging unavailable: %s", PLUGIN_NAME, _dbg_exc)
 
 def _read_worker_task_id() -> str:
     """Read the host worker signal at the adapter boundary only."""

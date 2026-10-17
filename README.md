@@ -126,6 +126,27 @@ classifier:
   api_key_env: null  # or an environment-variable name when authentication is required
 ```
 
+Reasoning-template local models (Qwen3-style templates, MiniCPM, DeepSeek-R1 distills on llama.cpp `--jinja`) can answer into `reasoning_content` and leave `content` empty, which fails the strict classifier contract open every turn. Pass per-request body fields to the classifier call:
+
+```yaml
+classifier:
+  disable_thinking: true        # sugar for chat_template_kwargs: {enable_thinking: false}
+  extra_body:                   # optional; merged on top, forwarded verbatim
+    chat_template_kwargs: {enable_thinking: false}
+```
+
+Only set these for servers that accept them; an unknown field rejected by the provider fails open like any other classifier error.
+
+### Profiles under a multiplexed gateway
+
+Each turn resolves the router profile from the agent (`agent._profile_name`), falling back to `HERMES_PROFILE` / `HERMES_HOME`. A gateway serving several profiles therefore applies each served profile's own `profiles:` entry instead of the launch profile's.
+
+### Diagnostics
+
+Every committed surface logs one INFO line (`surface committed session=... profile=... predicted=... tools=... toolsets=...`). Set `global.debug_logging: true` to also write every bail-out reason to a rotating `router-debug.log` in the plugin directory (2 MB x 3); host logging is unchanged.
+
+Keep plugin backups outside `plugins/`: a `plugins/<name>.bak-*` directory containing `plugin.yaml` is discovered as a separate live plugin and runs its hooks.
+
 ## Turning routing on and off
 
 `/router` switches routing for the running Hermes process without a model call and without changing config.yaml:

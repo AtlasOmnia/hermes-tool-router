@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Added
 
+- `classifier.extra_body` (forwarded to the classifier `chat.completions` call) and `classifier.disable_thinking: true` sugar for reasoning-template local models (#20, #21).
+- One INFO `surface committed` line per committed surface; opt-in `global.debug_logging` writes a rotating `router-debug.log` (#20, #21).
 - `/router on|off|status|reset` slash command: switches routing for the running Hermes process without a model call or config change (CLI, desktop/TUI, gateways; not one-shot `-z`). `HERMES_TOKEN_ROUTER_ENABLED=0` stays a kill switch it cannot override; turning a config-disabled profile on keeps that profile's configured settings; status reports config, environment and override separately.
 - Capability awareness after first-turn narrowing: `request_toolset` carries a per-session capability catalog (admitted toolsets with one-line descriptions; partially admitted toolsets list their admitted tools), so "what can you do?" is answered from the catalog instead of from the pruned surface. The `toolsets` parameter description is generated from the registry.
 - Standalone capability questions ("what can you do?", "list your tools", "tell me about your tools") are classified as `capability_inquiry` and keep the small surface; messages that also carry a task keep their normal routing.
@@ -29,6 +31,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Fixed
 
+- Profile resolution under a multiplexed gateway: turn-time routing binds to the agent's own profile (`agent._profile_name`) before the process environment, so served sessions no longer silently apply the launch profile's policy (#20, #21).
 - The router silently did nothing on current Hermes: `pre_llm_call`/`post_tool_call` run on a timeout worker thread where the stack walk could not see the agent. Agent lookup now also searches other live threads for the agent with the exact hook `session_id` (never another session's agent; ambiguous matches rejected; foreign-object exceptions contained).
 - Narrowing broke Hermes tool search: the `tool_search`/`tool_describe`/`tool_call` bridge is now always kept and toolsets reachable only through it stay in `enabled_toolsets` (protected toolsets excepted), so deferred tools such as `computer_use`, `cronjob_manage`, `browser_vault`, MCP and plugin tools remain usable.
 - A disabled router re-applied its first-turn snapshot every turn, removing tools added mid-session; it is now a no-op on a session it never narrowed, and a failed disable-time restore keeps the guard engaged and is retried.

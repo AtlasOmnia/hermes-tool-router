@@ -13,3 +13,4 @@ runs/
 .env
 .env.*
 !.env.example
+router-debug.log*
