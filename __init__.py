@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional, Set
 
 try:
     from .config import (
+        _agent_profile_name,
         _env_override,
         _get_profile_settings,
         CONFIG_FILE,
@@ -84,6 +85,7 @@ try:
     )
 except ImportError:  # pragma: no cover - direct loader fallback
     from config import (
+        _agent_profile_name,
         _env_override,
         _get_profile_settings,
         CONFIG_FILE,
@@ -341,15 +343,10 @@ def _profile_name_for(agent: Any = None) -> str | None:
 
     Under a multiplexed gateway the process env holds the launch profile
     (default); the agent carries its own. Mirrors the host convention in
-    run_agent.py (`agent._profile_name` first).
+    run_agent.py (`agent._profile_name` first); placeholders such as "?"
+    are ignored (#26).
     """
-    if agent is None:
-        return None
-    for attr in ("_profile_name", "agent_identity"):
-        val = getattr(agent, attr, None)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    return None
+    return _agent_profile_name(agent)
 
 
 def _config_enabled(cfg: Any, agent: Any = None) -> bool:

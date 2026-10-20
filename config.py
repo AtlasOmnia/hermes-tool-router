@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +14,28 @@ PLUGIN_NAME = "hermes-token-router"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.yaml"
 DEFAULT_ROUTER_MODEL = "deepseek-chat"
 DEFAULT_ROUTER_PROVIDER = "deepseek"
+
+# Shape of a Hermes profile id (hermes_constants.PROFILE_ID_RE, case-tolerant).
+# Anything else on an agent attribute -- "?", "-", blanks -- is a host
+# placeholder, not an identity, and must not shadow the fallbacks (#26).
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def _agent_profile_name(agent: Any = None) -> str | None:
+    """Profile the AGENT names for itself, or None when it names none.
+
+    Mirrors run_agent.py (``agent._profile_name`` first, then
+    ``agent_identity``); placeholder values are skipped, not trusted.
+    """
+    if agent is None:
+        return None
+    for attr in ("_profile_name", "agent_identity"):
+        val = getattr(agent, attr, None)
+        if isinstance(val, str) and _PROFILE_NAME_RE.match(val.strip()):
+            return val.strip()
+    return None
+
+
 def _load_config() -> dict:
     """Load router config from plugin's config.yaml.
 

@@ -132,3 +132,34 @@ def test_pyproject_has_no_build_system_table() -> None:
     doc = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
     assert "build-system" not in doc
     assert doc.get("tool", {}).get("uv", {}).get("package") is not True
+
+
+@pytest.mark.parametrize("placeholder", ["?", " ? ", "-", "*", "??", "<unknown>", "a b", 7])
+def test_placeholder_agent_profile_is_not_an_identity(placeholder: object) -> None:
+    """A host that stamps a placeholder (e.g. "?") on the agent must not win (#26)."""
+    assert router._profile_name_for(SimpleNamespace(_profile_name=placeholder)) is None
+    assert router._profile_name_for(
+        SimpleNamespace(_profile_name=placeholder, agent_identity="ai-os")) == "ai-os"
+    assert router._profile_name_for(SimpleNamespace(agent_identity=placeholder)) is None
+
+
+def test_commit_telemetry_skips_placeholder_profile(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """tui_gateway-served sessions logged profile=? while routing resolved ai-os (#26)."""
+    registry = _Rev6Registry()
+    _rev6_registry_modules(monkeypatch, registry)
+    _rev6_config(monkeypatch, registry)
+    tools_mod = sys.modules[router.__name__ + ".tools"]
+    monkeypatch.setattr(tools_mod, "_current_profile_name", lambda: "ai-os")
+    agent = _rev6_agent(registry, "telemetry-26", names=("web_search", "request_toolset"),
+                        enabled=("web", "router_recovery"))
+    agent._profile_name = "?"
+    agent.agent_identity = None
+    with caplog.at_level(logging.INFO):
+        router.tool_request_middleware(
+            agent=agent, session_id="telemetry-26", tool_name="read_file", args={})
+    lines = [r.getMessage() for r in caplog.records if "surface committed" in r.getMessage()]
+    assert lines
+    assert all("profile=ai-os " in line for line in lines), lines
+    assert not any("profile=? " in line for line in lines), lines
