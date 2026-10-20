@@ -20,7 +20,7 @@ try:
         thaw_envelope_definitions,
         thaw_json,
     )
-    from .config import PLUGIN_NAME, _current_profile_name
+    from .config import PLUGIN_NAME, _agent_profile_name, _current_profile_name
     from .policy import TOOLSET_DESCRIPTIONS
     from .state import _get_router_state
 except ImportError:  # pragma: no cover - direct loader fallback
@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - direct loader fallback
         thaw_envelope_definitions,
         thaw_json,
     )
-    from config import PLUGIN_NAME, _current_profile_name
+    from config import PLUGIN_NAME, _agent_profile_name, _current_profile_name
     from policy import TOOLSET_DESCRIPTIONS
     from state import _get_router_state
 
@@ -632,8 +632,7 @@ def _assign_candidate(
         "hermes-token-router: surface committed session=%s profile=%s initial=%s "
         "predicted=%s tools=%d toolsets=%s",
         str(getattr(agent, "session_id", "") or "")[:24],
-        getattr(agent, "_profile_name", None) or getattr(agent, "agent_identity", None)
-        or _current_profile_name(),
+        _agent_profile_name(agent) or _current_profile_name(),
         initial, sorted(predicted_toolsets) if predicted_toolsets is not None else None,
         len(names), sorted(enabled),
     )
