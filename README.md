@@ -1,5 +1,7 @@
 # Hermes Tool Router
 
+> Part of the AtlasOmnia Hermes Agent toolset → [hermesagenttools.com/hermes-agent/](https://hermesagenttools.com/hermes-agent/)
+
 Experimental standalone Hermes Agent plugin for reducing first-turn tool-schema overhead without repeatedly changing the tool prefix later in the conversation.
 
 > Test on a separate Hermes profile first. Do not install an experimental router directly on a primary profile.
