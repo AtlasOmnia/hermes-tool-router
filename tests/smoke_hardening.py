@@ -268,6 +268,40 @@ def test_inert_period_probes_skip_classifier_without_capturing_symbols(monkeypat
         assert "web" in _exposed_toolsets(agent)
 
 
+def test_unresolved_rules_fall_through_to_enabled_classifier(monkeypatch):
+    """Issue #28: rule-first profiles consult the classifier when rules abstain."""
+    monkeypatch.setitem(_TEST_CONFIG["global"], "deterministic_rules_enabled", True)
+    monkeypatch.setitem(
+        _TEST_CONFIG["global"],
+        "classifier",
+        {"enabled": True, "provider": "openrouter", "model": "fake-router"},
+    )
+    classified = []
+
+    def narrowing_classifier(user_message, *args, **kwargs):
+        classified.append(user_message)
+        return {"image_gen"}
+
+    monkeypatch.setattr(plugin, "_predict_toolsets_via_llm", narrowing_classifier)
+    agent = _route("生成一张图")
+    assert classified == ["生成一张图"]
+    assert _exposed_toolsets(agent) == {"image_gen", "request_toolset"}
+
+    # Rules that do resolve never pay for a classifier call.
+    _assert_route("latest weather today", {"web", "request_toolset"})
+    assert classified == ["生成一张图"]
+
+
+def test_unresolved_non_latin_fails_open_without_classifier(monkeypatch):
+    """Issue #28: without a classifier, unresolved CJK keeps the full surface."""
+    monkeypatch.setitem(_TEST_CONFIG["global"], "deterministic_rules_enabled", True)
+    monkeypatch.setitem(_TEST_CONFIG["global"], "classifier", {"enabled": False})
+    full = {ts for ts in _FAKE_REGISTRY.TOOLSETS if ts != "router_recovery"}
+    for prompt in ("生成一张图", "记住这个", "查一下"):
+        exposed = _exposed_toolsets(_route(prompt))
+        assert full <= exposed, (prompt, exposed)
+
+
 def test_late_pre_llm_compatibility_routes_before_request_without_explicit_agent():
     agent = _FakeAgent()
     agent._current_turn_id = "late-turn"

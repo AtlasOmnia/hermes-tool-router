@@ -4597,8 +4597,15 @@ def test_generic_unmarked_english_and_other_language_keep_classifier_branch_sema
                 turn_id="generic-rules-turn",
                 user_message=prompt,
             )
-            assert rules_alias == []
-            assert rules_client == []
+            if prompt.isascii():
+                # Resolved by the English plain_short rule: no classifier call.
+                assert rules_alias == []
+                assert rules_client == []
+            else:
+                # Issue #28: ASCII heuristics cannot read other scripts, so the
+                # rules return no decision and the enabled classifier decides.
+                assert len(rules_alias) == 1
+                assert len(rules_client) == 1
 
         with monkeypatch.context() as patch:
             registry = _Rev6Registry()

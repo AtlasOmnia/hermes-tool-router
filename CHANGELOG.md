@@ -31,6 +31,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Fixed
 
+- Non-Latin first-turn prompts (Chinese, Japanese, Korean, Cyrillic, ...) that no deterministic rule resolves are no longer committed as an empty tool surface by the ASCII-only `plain_short` / `plain_answer` / `plain_default` shortcuts; the rules now return no decision (`unresolved_non_latin`), so the turn goes to the classifier or keeps the full surface (#28).
+- With `deterministic_rules_enabled: true`, an enabled classifier is consulted again when the rules return no decision, as documented; it had been skipped since the host-admission envelope refactor (#28).
 - Desktop/`tui_gateway` sessions served for a profile resolve that profile from the host's per-turn `HERMES_HOME` binding; current hosts set no `agent._profile_name`, so they previously fell back to the launch profile (#23).
 - The plugin can be installed in the launch home and a profile together: `pyproject.toml` drops `[build-system]`, so Hermes' dependency manager no longer sees two workspace members named `hermes-tool-router` and stops disabling the profile copy (#20, #23).
 - A placeholder agent identity (such as `?`) no longer shadows profile resolution: `surface committed` telemetry on `tui_gateway`-served sessions reported `profile=?`. Agent `_profile_name`/`agent_identity` values are accepted only when they have the shape of a profile id; otherwise the served/env/`HERMES_HOME` fallbacks apply, for routing and telemetry alike (#26).

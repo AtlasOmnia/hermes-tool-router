@@ -46,3 +46,41 @@ def test_classifier_prompt_formats_literal_json_contract():
     assert 'Return ONLY JSON: {"toolsets": ["name"], "confidence": 0.0}.' in prompt
     assert '{"toolsets": ["terminal", "file"], "confidence": 0.96}' in prompt
     assert 'Personal calendar, itinerary, reservation, or flight-detail lookups require "skills" and "terminal"' in prompt
+
+
+# Issue #28: the plain_short / plain_answer / plain_default shortcuts count
+# ASCII words and match English action hints only, so they cannot read text in
+# other scripts.  Such text must stay unresolved (None -> classifier or full
+# surface) instead of being committed as an empty tool surface.
+NON_LATIN_ACTION_PROMPTS = (
+    "生成一张图",
+    "记住这个",
+    "查一下",
+    "帮我截个屏",
+    "打开浏览器登录我的账号",
+    "把这个文件改一下",
+    "帮我把这个项目的依赖全部升级到最新版本然后确认一切正常",
+    "画像を作成して",
+    "이 파일을 열어줘",
+    "Найди погоду в Москве",
+)
+
+
+def test_non_latin_prompts_are_never_committed_empty_by_ascii_heuristics():
+    for prompt in NON_LATIN_ACTION_PROMPTS:
+        predicted, reason = _predict_toolsets_by_rules(prompt, AVAILABLE)
+        assert predicted is None, (prompt, predicted, reason)
+        assert reason == "unresolved_non_latin", (prompt, reason)
+
+
+def test_resolved_chinese_routes_are_unchanged():
+    assert _predict_toolsets_by_rules("运行 pytest", AVAILABLE)[0] == {"terminal"}
+    assert _predict_toolsets_by_rules("帮我打开这个文件的内容", AVAILABLE)[0] == {"file"}
+    # Chinese conceptual questions remain answer-only.
+    assert _predict_toolsets_by_rules("什么是量子计算", AVAILABLE)[0] == set()
+
+
+def test_latin_plain_shortcuts_still_answer_without_tools():
+    for prompt in ("hi", "thanks!", "café olé", "good morning, how are you"):
+        predicted, reason = _predict_toolsets_by_rules(prompt, AVAILABLE)
+        assert predicted == set(), (prompt, predicted, reason)

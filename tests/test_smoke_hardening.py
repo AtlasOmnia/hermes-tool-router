@@ -14,4 +14,6 @@ from smoke_hardening import (  # noqa: F401
     test_request_toolset_git_expansion,
     test_request_toolset_unknown_suggestion,
     test_tool_request_middleware_expands_registered_pruned_tool_before_validation,
+    test_unresolved_non_latin_fails_open_without_classifier,
+    test_unresolved_rules_fall_through_to_enabled_classifier,
 )

@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from typing import Any, Dict, List, Optional, Set
 
 try:
@@ -209,6 +210,16 @@ def _build_toolset_description_block(available: Set[str]) -> str:
         desc = TOOLSET_DESCRIPTIONS.get(name, f"Tools for {name}")
         lines.append(f"  - {name}: {desc}")
     return "\n".join(lines)
+def _has_non_latin_letters(text: str) -> bool:
+    """Return whether text contains a letter outside the Latin script."""
+    return any(
+        char.isalpha()
+        and not char.isascii()
+        and not unicodedata.name(char, "").startswith("LATIN")
+        for char in text
+    )
+
+
 def _predict_toolsets_by_rules(
     user_message: str,
     available_toolsets: Set[str],
@@ -254,6 +265,13 @@ def _predict_toolsets_by_rules(
     matched &= available_toolsets
     if matched:
         return matched, f"rules:{matched_rules}"
+
+    # The plain_* shortcuts below count ASCII words and match English action
+    # hints only. They cannot read CJK, Cyrillic, or other non-Latin text,
+    # so an unresolved message in those scripts stays undecided (classifier
+    # or full surface) instead of being committed as an empty surface.
+    if _has_non_latin_letters(text):
+        return None, "unresolved_non_latin"
 
     words = re.findall(r"[a-z0-9']+", lowered)
     if len(words) <= 4 and not ACTION_HINT_RE.search(lowered):
