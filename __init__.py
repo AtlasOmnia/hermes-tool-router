@@ -990,13 +990,15 @@ def _route_fenced(
 
     deterministic_enabled = bool(profile_cfg.get("deterministic_rules_enabled", True))
     probe_chars = {char for char in user_message if not char.isspace()}
+    predicted: Optional[Set[str]] = None
     if not probe_chars or probe_chars <= {".", "…"}:
-        predicted: Optional[Set[str]] = set()
+        predicted = set()
     elif deterministic_enabled:
         predicted, _ = _predict_toolsets_by_rules(user_message, available)
-    elif not _is_classifier_enabled(profile_cfg):
-        predicted = None
-    else:
+    # Rule-first profiles consult the optional classifier only when the
+    # deterministic policy returns no decision (None); disabled or failing
+    # classifiers keep the fail-open full surface.
+    if predicted is None and _is_classifier_enabled(profile_cfg):
         try:
             predicted = _predict_toolsets_via_llm(
                 user_message,
