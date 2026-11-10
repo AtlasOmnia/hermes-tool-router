@@ -212,11 +212,13 @@ def _build_toolset_description_block(available: Set[str]) -> str:
     return "\n".join(lines)
 def _has_non_latin_letters(text: str) -> bool:
     """Return whether text contains a letter outside the Latin script."""
+    # NFKC folds fullwidth/compatibility Latin (e.g. fullwidth "Ｈｅｌｌｏ")
+    # back to ordinary Latin letters before the script check.
     return any(
         char.isalpha()
         and not char.isascii()
         and not unicodedata.name(char, "").startswith("LATIN")
-        for char in text
+        for char in unicodedata.normalize("NFKC", text)
     )
 
 

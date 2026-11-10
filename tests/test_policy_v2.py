@@ -84,3 +84,8 @@ def test_latin_plain_shortcuts_still_answer_without_tools():
     for prompt in ("hi", "thanks!", "café olé", "good morning, how are you"):
         predicted, reason = _predict_toolsets_by_rules(prompt, AVAILABLE)
         assert predicted == set(), (prompt, predicted, reason)
+
+
+def test_fullwidth_latin_is_treated_as_latin():
+    predicted, reason = _predict_toolsets_by_rules("Ｈｅｌｌｏ", AVAILABLE)
+    assert predicted == set(), (predicted, reason)
